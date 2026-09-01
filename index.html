@@ -465,36 +465,69 @@ float layerForm(vec3 p, float h, float hf){
   return cov * heightGradient(clamp(hf, 0.0, 1.0), st, tall);
 }
 
-float stormForm(vec3 p, float h){
+/* The anvil is not a slab. It is a lens of glaciated ice spreading at the
+   equilibrium level: thick at the centre, tapering to a sharp rim, domed on top
+   and comparatively flat beneath, and — because it has already frozen and is
+   spreading laminarly — far smoother than the boiling tower that feeds it.
+   `ice` reports how much of this sample is that canopy, so the erosion stage can
+   leave it alone; `anvTop` is the local top of the canopy, for occlusion. */
+float stormForm(vec3 p, float h, out float ice, out float anvTop){
+  ice = 0.0; anvTop = 0.0;
   if (uSuper <= 0.0) return 0.0;
   vec2 ax = uStorm + gWindDir * max(h - uBase, 0.0) * uShear * 0.30;
   vec2 d2 = p.xz - ax;
   float r = length(d2);
 
-  float colTop  = uEL;
-  float core    = 4200.0;
-  float colProf = smoothstep(uBase - 40.0, uBase + 460.0, h) * smoothstep(colTop + 1200.0, colTop - 2600.0, h);
+  float colTop = uEL;
+  float core   = 4200.0;
+
+  // Updraft tower: boiling, cauliflower, and it stops at the condensation level.
+  float colProf = smoothstep(uBase - 40.0, uBase + 460.0, h) * smoothstep(colTop + 900.0, colTop - 3000.0, h);
   float colR    = core * (0.45 + 1.15 * smoothstep(uBase, colTop, h));
   float col     = smoothstep(colR, colR * 0.28, r) * colProf;
 
-  float aH        = (h - colTop) / 2800.0;
-  float anvilProf = smoothstep(-0.20, 0.30, aH) * smoothstep(1.50, 0.62, aH);
-  float anvR      = core * (2.2 + 10.0 * clamp(aH * 1.5, 0.0, 1.0));
-  vec2  ad        = d2 - gWindDir * clamp(aH, 0.0, 1.0) * 11000.0;
-  float aR        = clamp(length(ad) / max(anvR, 1.0), 0.0, 1.0);
-  float anvil     = smoothstep(anvR, anvR * 0.30, length(ad)) * anvilProf * (1.0 - 0.55 * aR * aR);
+  // The canopy. An elliptical cross-section gives the sharp thin rim that a
+  // linear taper never does, and it is what the eye reads as "anvil".
+  vec2  ad = d2 - gWindDir * 5200.0;
+  // Outflow spreads further downwind than up, so the canopy is an ellipse, and
+  // its rim is scalloped rather than turned on a lathe.
+  vec2  wa = vec2(dot(ad, gWindDir) / 1.35, dot(ad, vec2(-gWindDir.y, gWindDir.x)));
+  float ang  = atan(wa.y, wa.x);
+  float anvR = core * 5.0 * (0.80 + 0.42 * fbm2c(vec2(cos(ang), sin(ang)) * 1.8 + 7.3));
+  float u    = length(wa) / anvR;
+  float lens = pow(max(1.0 - u * u, 0.0), 0.35);
+  float mid  = colTop + 400.0;
+  float thick = 5200.0 * lens;
+  float aT    = mid + thick * 0.64;
+  float aB    = mid - thick * 0.36;
+  float anvil = smoothstep(aT, aT - 520.0, h) * smoothstep(aB, aB + 460.0, h);
+  // Faint radial striations, the way the outflow actually spreads.
+  anvil *= 0.94 + 0.06 * sin(u * 30.0 + ang * 3.0);
 
-  float ov = smoothstep(core * 0.8, 0.0, r) * smoothstep(colTop + 2400.0, colTop + 300.0, h)
-           * step(colTop, h) * 0.7;
+  // Overshooting top: the one rough thing on the canopy, punched through the
+  // ice by an updraft that outran its own buoyancy. Sits upwind of centre.
+  vec2  oc  = uStorm - gWindDir * 1600.0;
+  float ro  = length(p.xz - oc);
+  float ovR = core * 1.05;
+  float ov  = smoothstep(ovR, ovR * 0.30, ro)
+            * smoothstep(aT + 3000.0, aT - 1100.0, h) * step(aB, h) * 0.95;
 
   // Lowered, rotating cloud base under the mesocyclone.
   float lower = uBase - min(380.0, uBase * 0.42);
   float wall = smoothstep(2200.0, 700.0, r) * smoothstep(lower, lower + 320.0, h)
              * smoothstep(uBase + 2200.0, uBase + 400.0, h) * 0.8;
 
-  // Turbulent modulation keeps the silhouette from reading as a solid of revolution.
+  // Turbulence belongs to the convective parts, not to the frozen canopy.
   float turb = 0.66 + 0.66 * fbm2c(d2 * 0.00034 + vec2(h * 0.00022, uTime * 0.006));
-  return clamp(max(max(col, anvil * 0.95), max(ov, wall)) * uSuper * turb * 0.86, 0.0, 1.0);
+  col  *= turb;
+  wall *= turb;
+  ov   *= 0.80 + 0.35 * turb;
+  anvil *= 0.96 + 0.08 * turb;
+
+  float total = max(max(col, anvil), max(ov, wall));
+  if (total > 1e-4) ice = clamp((anvil - max(ov, col) * 1.2) / total, 0.0, 1.0);
+  anvTop = aT;
+  return clamp(total * uSuper * 0.94, 0.0, 1.0);
 }
 
 float funnelForm(vec3 p, float h){
@@ -596,7 +629,7 @@ float microForm(vec3 p, float h, out float dustRing){
 }
 
 /* Returns: x = density, y = dust fraction, z = ash fraction, w = sky occlusion. */
-vec4 sampleMedium(vec3 p, bool cheap){
+vec4 sampleMedium(vec3 p, bool cheap, float lod){
   float h  = hgt(p);
   if (h < gLoH - 50.0 || h > gHiH + 50.0) return vec4(0.0);
   float hf = (h - uBase) / max(uTop - uBase, 1.0);
@@ -604,7 +637,9 @@ vec4 sampleMedium(vec3 p, bool cheap){
   float water = 0.0, dust = 0.0, ash = 0.0;
 
   if (hf > -0.02 && hf < 1.02) water = layerForm(p, h, hf);
-  water = max(water, stormForm(p, h));
+  float ice = 0.0, anvTop = 0.0;
+  float storm = stormForm(p, h, ice, anvTop);
+  water = max(water, storm);
   float lent = lentForm(p);
   water = max(water, lent);
   water = max(water, virgaForm(p, h));
@@ -652,18 +687,25 @@ vec4 sampleMedium(vec3 p, bool cheap){
   float d = remap(sn.r, 1.0 - form, 1.0, 0.0, 1.0);
   if (d <= 0.0) return vec4(0.0);
 
+  float midW  = 1.0 - smoothstep(340.0, 1500.0, lod);
+  float fineW = 1.0 - smoothstep(70.0, 300.0, lod);
   float keep = 1.0 - form * 0.22;          // dense cores keep their mass
-  // Lens clouds form in laminar flow. Eroding them with turbulence noise is
-  // exactly wrong — it is why they look smooth and cut from soap in real life.
-  keep *= 1.0 - clamp(lent / max(form, 1e-4), 0.0, 1.0) * 0.88;
+  // Lens clouds and the glaciated anvil both form in laminar flow. Eroding them
+  // with turbulence noise is exactly wrong — it is why they look smooth and cut
+  // from soap in real life, while the tower beside them boils.
+  float iceFrac = ice * clamp(storm / max(form, 1e-4), 0.0, 1.0);
+  float laminar = max(clamp(lent / max(form, 1e-4), 0.0, 1.0), iceFrac);
+  keep *= 1.0 - laminar * 0.72;
   if (!cheap){
     // Medium erosion, taken from the shape volume's own Worley octaves rather
     // than a third texture: cauliflower up top, filaments down at the base.
     float mid = sn.b * 0.62 + sn.a * 0.38;
     mid = mix(mid, 1.0 - mid, clamp(hf * 2.4, 0.0, 1.0));
-    d = remap(d, mid * 0.34 * keep, 1.0, 0.0, 1.0);
+    d = remap(d, mid * 0.34 * keep * midW, 1.0, 0.0, 1.0);
     if (d <= 0.0) return vec4(0.0);
 
+    if (fineW <= 0.01) { d = clamp(d, 0.0, 1.0) * uDensity; }
+    else {
     // Fine erosion, swirled so edges churn instead of sliding downwind rigidly
     // with the body of the cloud.
     vec3 dp = wp * 0.0021;
@@ -673,7 +715,8 @@ vec4 sampleMedium(vec3 p, bool cheap){
     vec3 dn = texture(uDetail, dp).rgb;
     float det = dn.r * 0.625 + dn.g * 0.25 + dn.b * 0.125;
     det = mix(det, 1.0 - det, clamp(hf * 2.2, 0.0, 1.0));
-    d = remap(d, det * 0.30 * keep, 1.0, 0.0, 1.0);
+    d = remap(d, det * 0.30 * keep * fineW, 1.0, 0.0, 1.0);
+    }
   }
   d = clamp(d, 0.0, 1.0) * uDensity;
 
@@ -681,11 +724,17 @@ vec4 sampleMedium(vec3 p, bool cheap){
   // sees almost no sky, which is why storm bases are dark and flat-lit. Measured
   // against the top of whatever this sample belongs to, so a shallow fog bank
   // is not shaded like a 14 km cumulonimbus.
-  float mTop = (hf > 1.0 && uSuper > 0.0) ? uEL : uTop;
-  float span = max(mTop - uBase, 200.0);
   float ao = 1.0;
-  if (h > uBase - 20.0)
-    ao = exp(-form * clamp((mTop - h) / span, 0.0, 1.0) * span * 0.0016);
+  if (iceFrac > 0.3){
+    // Inside the canopy, occlusion is depth below its own top. This is what
+    // turns the underside of an anvil near-black while its top stays brilliant.
+    ao = exp(-max(anvTop - h, 0.0) * 0.00055);
+  } else {
+    float mTop = (hf > 1.0 && uSuper > 0.0) ? uEL : uTop;
+    float span = max(mTop - uBase, 200.0);
+    if (h > uBase - 20.0)
+      ao = exp(-form * clamp((mTop - h) / span, 0.0, 1.0) * span * 0.0016);
+  }
 
   float tot = max(water + dust + ash, 1e-4);
   return vec4(d, dust / tot, ash / tot, ao);
@@ -701,7 +750,8 @@ float cloudShadow(vec3 p){
   float t = (mid - h) / max(uSun.y, 0.02);
   vec3 q = p + uSun * t;
   float hf = 0.5;
-  float form = layerForm(q, mid, hf) + stormForm(q, mid) * 1.6;
+  float sIce, sTop;
+  float form = layerForm(q, mid, hf) + stormForm(q, mid, sIce, sTop) * 1.6;
   return clamp(1.0 - form * 1.45, 0.06, 1.0);
 }
 
@@ -747,6 +797,11 @@ vec3 skyColour(vec3 rd){
     }
   }
 
+  // Above most of the air column the sky goes near-black overhead and keeps a
+  // bright limb; without this, a view from the stratosphere looks like haze.
+  float thin = clamp((hgt(uCam) - 4000.0) / 22000.0, 0.0, 1.0);
+  col *= mix(1.0, mix(0.55, 0.13, pow(clamp(up, 0.0, 1.0), 0.45)), thin);
+
   // Ground haze below the horizon.
   col = mix(col, mix(vec3(0.02, 0.022, 0.028), hor * 0.55, day), smoothstep(0.0, -0.09, rd.y));
   return col;
@@ -771,11 +826,11 @@ const vec3 kCone[6] = vec3[6](
   vec3( 0.31,-0.19,  0.08), vec3(-0.12,-0.28, -0.21),
   vec3( 0.22, 0.30,  0.26), vec3(-0.33, 0.14, -0.09));
 
-float lightMarch(vec3 p){
+float lightMarch(vec3 p, float lod){
   float d = 0.0, t = 0.0, dt = 70.0;
   for (int i = 0; i < 6; i++){
     vec3 q = p + uSun * (t + dt * 0.5) + kCone[i] * dt * 0.9;
-    d += sampleMedium(q, true).x * dt;
+    d += sampleMedium(q, true, max(dt, lod)).x * dt;
     t += dt; dt *= 1.65;
   }
   return d;
@@ -810,12 +865,12 @@ vec4 marchClouds(vec3 ro, vec3 rd, float tMax, float jitter, out float meanT){
   for (int i = 0; i < 320; i++){
     if (i >= uSteps || t > t1 || tr < 0.02) break;
     float dt = max(dtBase, t * 0.035);
-    vec3  p  = ro + rd * t;
-    vec4  m  = sampleMedium(p, cheap);
+    vec3  p  = ro + rd * (t + dt * jitter);
+    vec4  m  = sampleMedium(p, cheap, dt);
 
     if (cheap){
-      if (m.x > 0.0){ cheap = false; t -= dt * 0.6; continue; }
-      t += dt * 2.0; continue;
+      if (m.x > 0.0){ cheap = false; t -= dt * 2.6; continue; }
+      t += dt * 3.0; continue;
     }
     if (m.x <= 0.0){
       empty++;
@@ -826,7 +881,7 @@ vec4 marchClouds(vec3 ro, vec3 rd, float tMax, float jitter, out float meanT){
 
     vec3  alb   = mix(mix(vec3(1.0), vec3(0.96, 0.68, 0.40), m.y), vec3(0.44, 0.41, 0.38), m.z);
     float sigma = mix(mix(0.012, 0.030, m.y), 0.055, m.z);
-    float sunD  = lightMarch(p);
+    float sunD  = lightMarch(p, dt);
     float hf    = clamp((hgt(p) - uBase) / max(uTop - uBase, 1.0), 0.0, 1.0);
 
     // Three energy-attenuated octaves stand in for multiple scattering.
@@ -854,7 +909,13 @@ vec4 marchClouds(vec3 ro, vec3 rd, float tMax, float jitter, out float meanT){
       lum += vec3(1.0, 0.72, 0.30) * 4.0e6 / (dot(dl, dl) + 4.0e4);
     }
 
-    vec3  amb = ambientAt(hf) * 0.44 * mix(0.22, 1.0, m.w) * mix(1.0, 0.60, m.z);
+    // Light reaching a shaded parcel arrives from below — ground bounce and the
+    // horizon — not from the zenith. Lighting an anvil's underside with zenith
+    // blue is what turns it into a sheet of stained glass.
+    vec3 skyAmb = ambientAt(hf);
+    vec3 gndAmb = sunColour() * 0.14 * max(uSun.y, 0.0)
+                * mix(vec3(0.55, 0.60, 0.50), vec3(0.78, 0.64, 0.46), uGround);
+    vec3 amb = mix(gndAmb, skyAmb, mix(0.04, 1.0, m.w)) * 0.44 * mix(1.0, 0.60, m.z);
     float ext = sigma * m.x;
     float sT  = exp(-ext * dt);
     vec3  S   = alb * ext * (lum + amb);
@@ -1270,7 +1331,7 @@ const EASED = ["virga","fog","halo","glory","pillar","lent","cavum","super","tor
 const A = {}; EASED.forEach(k => A[k] = S[k]);
 
 const QUALITY = [
-  { name: "Low",  steps: 52,  scale: 0.42, sharp: 0.5 },
+  { name: "Low",  steps: 64,  scale: 0.42, sharp: 0.5 },
   { name: "Med",  steps: 88,  scale: 0.58, sharp: 0.4 },
   { name: "High", steps: 140, scale: 0.78, sharp: 0.3 },
   { name: "Ultra",steps: 200, scale: 1.00, sharp: 0.2 }
@@ -1408,11 +1469,11 @@ const SCENARIOS = [
     storm:[6000,9000], cam:[0,2950,-9000], look:[0,1650,4000] },
 
   { id:"super", hue:"var(--b)", name:"Supercell", tag:"Tier B · rotating storm", g:G.super,
-    desc:"3200 J/kg of CAPE under 25 m/s of shear. The updraft tilts, the anvil shears downwind, the base rotates.",
-    set:{ dewDep:8, cape:3200, coverage:0.22, stratus:0, cirrus:0, windSpd:15, windDir:200, shear:7,
+    desc:"3200 J/kg of CAPE under 25 m/s of shear, seen level with the anvil. Smooth glaciated canopy, rough overshooting top, rotating base.",
+    set:{ dewDep:8, cape:3200, coverage:0.30, stratus:0, cirrus:0, windSpd:15, windDir:200, shear:7,
           sunElev:19, sunAz:255, haze:0.55, terrain:300, ground:0.35, snow:6000, sea:-400,
           virga:1,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:1,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
-    storm:[4000,6000], cam:[-6000,700,-8000], look:[4000,6200,6000] },
+    storm:[4000,6000], cam:[-13000,12600,-15000], look:[4000,14100,6000] },
 
   { id:"torn", hue:"var(--b)", name:"Tornado", tag:"Tier B · condensation funnel", g:G.torn,
     desc:"A low condensation level lets the funnel reach the ground. Raise the dew-point depression and it lifts.",
