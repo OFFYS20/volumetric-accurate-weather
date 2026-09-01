@@ -466,7 +466,7 @@ float stormForm(vec3 p, float h){
 
   float colTop  = uEL;
   float core    = 4200.0;
-  float colProf = smoothstep(uBase - 700.0, uBase + 300.0, h) * smoothstep(colTop + 1200.0, colTop - 2600.0, h);
+  float colProf = smoothstep(uBase - 40.0, uBase + 460.0, h) * smoothstep(colTop + 1200.0, colTop - 2600.0, h);
   float colR    = core * (0.45 + 1.15 * smoothstep(uBase, colTop, h));
   float col     = smoothstep(colR, colR * 0.28, r) * colProf;
 
@@ -481,7 +481,8 @@ float stormForm(vec3 p, float h){
            * step(colTop, h) * 0.7;
 
   // Lowered, rotating cloud base under the mesocyclone.
-  float wall = smoothstep(2200.0, 700.0, r) * smoothstep(uBase - 900.0, uBase + 100.0, h)
+  float lower = uBase - min(380.0, uBase * 0.42);
+  float wall = smoothstep(2200.0, 700.0, r) * smoothstep(lower, lower + 320.0, h)
              * smoothstep(uBase + 2200.0, uBase + 400.0, h) * 0.8;
 
   // Turbulent modulation keeps the silhouette from reading as a solid of revolution.
@@ -492,13 +493,25 @@ float stormForm(vec3 p, float h){
 float funnelForm(vec3 p, float h){
   if (uTorn <= 0.0 || h > uBase + 400.0) return 0.0;
   float f  = clamp(h / max(uBase, 1.0), 0.0, 1.0);
-  vec2  ax = uStorm + vec2(sin(uTime * 0.11) * 220.0, cos(uTime * 0.09) * 220.0);
-  float r  = length(p.xz - ax) ;
-  // Radius from the pressure deficit: narrow rope at the surface, flaring into
-  // the wall cloud. A high condensation level keeps it from reaching down.
-  float rf = mix(120.0, 650.0, pow(f, 2.0)) * (1.0 + 0.24 * sin(h * 0.0045 + uTime * 1.7));
+
+  // The condensation funnel leans downwind and snakes; a vertical cylinder is
+  // the one shape a real vortex never has.
+  vec2 ax = uStorm
+          + vec2(sin(uTime * 0.11) * 190.0, cos(uTime * 0.09) * 190.0)
+          + gWindDir * (1.0 - f) * 210.0
+          + vec2(-gWindDir.y, gWindDir.x) * sin(f * 4.1 + uTime * 0.6) * 130.0 * (1.0 - f);
+  float r = length(p.xz - ax);
+
+  // Radius follows the pressure deficit: a rope at the surface widening into the
+  // wall cloud. Aspect ratio matters more than absolute width — this is what
+  // separates it from the parent updraft.
+  float rf = mix(75.0, 330.0, pow(f, 1.5)) * (1.0 + 0.22 * sin(h * 0.0055 + uTime * 1.7));
   float reach = smoothstep(0.0, 0.30, f + (uTorn - 1.0) * 1.6 + 0.30);
-  return smoothstep(rf, rf * 0.5, r) * reach * uTorn;
+
+  // Near the surface the condensation is lost inside the debris cloud, which is
+  // a different medium and gets its own colour.
+  float veil = smoothstep(0.0, 0.16, f);
+  return smoothstep(rf, rf * 0.45, r) * reach * veil * uTorn;
 }
 
 float virgaForm(vec3 p, float h){
@@ -607,7 +620,9 @@ vec3 sampleMedium(vec3 p, bool cheap){
   dust = max(dust, ring);
   if (uTorn > 0.0){                                   // debris cloud at the surface
     float r = length(p.xz - uStorm);
-    dust = max(dust, smoothstep(1900.0, 0.0, r) * smoothstep(1100.0, 0.0, h) * uTorn * 1.05);
+    float deb = smoothstep(500.0, 0.0, r) * smoothstep(380.0, 0.0, h);     // ground contact
+    deb += smoothstep(190.0, 0.0, r) * smoothstep(950.0, 0.0, h) * 0.85;   // lofted sheath
+    dust = max(dust, clamp(deb, 0.0, 1.0) * uTorn * 1.1);
   }
   ash = ashForm(p, h);
 
@@ -615,14 +630,23 @@ vec3 sampleMedium(vec3 p, bool cheap){
   if (form <= 0.02) return vec3(0.0);
 
   // Shape volume, advected with the wind so detail travels with the air.
-  vec3 sp = (p - vec3(uWind.x, 0.0, uWind.y) * uTime) * 0.00019;
+  vec3 wp = p;
+  if (uSuper > 0.0){
+    // Mesocyclone: spin the noise lookup about the updraft axis, fastest near
+    // the core, so the wall cloud and the flanking bands visibly rotate.
+    vec2  dm = wp.xz - uStorm;
+    float rm = length(dm);
+    float om = 0.11 * exp(-rm / 5200.0) * uSuper;
+    wp.xz = uStorm + rot2(dm, uTime * om);
+  }
+  vec3 sp = (wp - vec3(uWind.x, 0.0, uWind.y) * uTime) * 0.00019;
   vec4 sn = texture(uShape, sp);
   float shape = sn.r * 0.85 + sn.g * 0.15;
   float d = remap(shape, 1.0 - form, 1.0, 0.0, 1.0);
   if (d <= 0.0) return vec3(0.0);
 
   if (!cheap){
-    vec3 dp = (p - vec3(uWind.x, 0.0, uWind.y) * uTime * 1.4) * 0.0016;
+    vec3 dp = (wp - vec3(uWind.x, 0.0, uWind.y) * uTime * 1.4) * 0.0016;
     vec3 dn = texture(uDetail, dp).rgb;
     float det = dn.r * 0.625 + dn.g * 0.25 + dn.b * 0.125;
     det = mix(det, 1.0 - det, clamp(hf * 2.2, 0.0, 1.0));    // wispy below, billowy above
@@ -733,7 +757,7 @@ vec4 marchClouds(vec3 ro, vec3 rd, float tMax, float jitter, out float meanT){
   if (t1 <= t0) return vec4(0.0, 0.0, 0.0, 1.0);
 
   float span   = max(gHiH - gLoH, 400.0);
-  float dtBase = max(span / float(uSteps) * 1.6, 22.0);
+  float dtBase = clamp(span / float(uSteps) * 1.6, 20.0, 150.0);
   float t  = t0 + jitter * dtBase;
   vec3  scat = vec3(0.0);
   float tr = 1.0, cosT = dot(rd, uSun);
@@ -744,7 +768,7 @@ vec4 marchClouds(vec3 ro, vec3 rd, float tMax, float jitter, out float meanT){
 
   for (int i = 0; i < 320; i++){
     if (i >= uSteps || t > t1 || tr < 0.02) break;
-    float dt = max(dtBase, t * 0.042);
+    float dt = max(dtBase, t * 0.035);
     vec3  p  = ro + rd * t;
     vec3  m  = sampleMedium(p, cheap);
 
@@ -1336,7 +1360,7 @@ const SCENARIOS = [
     set:{ dewDep:6, cape:3600, coverage:0.22, stratus:0, cirrus:0, windSpd:14, windDir:200, shear:8,
           sunElev:13, sunAz:255, haze:0.6, terrain:140, ground:0.4, snow:6000, sea:-400,
           virga:1,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:1,torn:1,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
-    storm:[1200,2200], cam:[-2400,380,-2800], look:[1200,1050,2200] },
+    storm:[1200,2200], cam:[-1500,300,-1900], look:[1200,820,2200] },
 
   { id:"haboob", hue:"var(--b)", name:"Haboob", tag:"Tier B · density current", g:G.haboob,
     desc:"A gravity current running out ahead of a dying storm, lofting a wall of dust with a rolling head.",
@@ -1371,7 +1395,7 @@ const SCENARIOS = [
     set:{ dewDep:9, cape:2600, coverage:0.30, stratus:0, cirrus:0, windSpd:10, windDir:200, shear:5,
           sunElev:-9, sunAz:320, haze:0.3, terrain:600, ground:0.2, snow:2600, sea:-400,
           virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:1,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:1,nlc:1,ball:0 },
-    storm:[30000,26000], cam:[-6000,2000,-10000], look:[30000,26000,26000] },
+    storm:[30000,26000], cam:[-6000,2000,-10000], look:[30000,33000,26000] },
 
   { id:"lee", hue:"var(--a)", name:"Lee Wave", tag:"Tier A · lenticular stack", g:G.lee,
     desc:"A standing gravity wave over the ridge. The air moves through at 22 m/s; the cloud does not move at all.",
