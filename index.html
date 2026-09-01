@@ -294,9 +294,9 @@ void main(){
     // Perlin–Worley: gradient noise remapped by cellular noise. Billowy where
     // the cells are, wispy in between — the low-frequency cloud shape.
     float pf = perlinFbm(p, 4.0);
-    float wf = worleyFbm(p, 6.0);
-    float pw = clamp(remap(pf, wf - 1.0, 1.0, 0.0, 1.0), 0.0, 1.0);
-    outColor = vec4(pw, worleyFbm(p, 6.0), worleyFbm(p, 12.0), worleyFbm(p, 24.0));
+    float w6 = worleyFbm(p, 6.0);
+    float pw = clamp(remap(pf, w6 - 1.0, 1.0, 0.0, 1.0), 0.0, 1.0);
+    outColor = vec4(pw, w6, worleyFbm(p, 13.0), worleyFbm(p, 27.0));
   } else {
     // High-frequency erosion detail.
     outColor = vec4(worleyFbm(p, 8.0), worleyFbm(p, 16.0), worleyFbm(p, 32.0), 1.0);
@@ -428,10 +428,12 @@ bool traceTerrain(vec3 ro, vec3 rd, out float tHit, out vec3 pHit){
 }
 
 /* ─────────────────────────── medium ─────────────────────────── */
-float heightGradient(float hf){
-  float cum = smoothstep(0.0, 0.13, hf) * smoothstep(1.0, 0.58, hf);
+float heightGradient(float hf, float st, float tall){
+  // `tall` lets one deck hold squat humilis and deep congestus at the same time,
+  // which is what a real convective field looks like from above.
+  float cum = smoothstep(0.0, 0.12 * tall, hf) * smoothstep(tall, tall * 0.55, hf);
   float str = smoothstep(0.0, 0.05, hf) * smoothstep(1.0, 0.72, hf);
-  return mix(cum, str, uStratus);
+  return mix(cum, str, st);
 }
 
 /* Layered cloud coverage as a 0..1 "how much cloud wants to be here" field. */
@@ -455,7 +457,12 @@ float layerForm(vec3 p, float h, float hf){
     float hole = smoothstep(2100.0 * uCavum, 3400.0 * uCavum, r);
     cov *= mix(1.0, hole, uCavum);
   }
-  return cov * heightGradient(clamp(hf, 0.0, 1.0));
+  // Large-scale character variation: parts of the field flatten toward
+  // stratocumulus, parts tower.
+  float typ  = fbm2c(q * 0.00007 + 31.7);
+  float st   = clamp(uStratus + (typ - 0.5) * 0.45, 0.0, 1.0);
+  float tall = mix(0.58, 1.18, smoothstep(0.32, 0.78, typ));
+  return cov * heightGradient(clamp(hf, 0.0, 1.0), st, tall);
 }
 
 float stormForm(vec3 p, float h){
@@ -588,17 +595,18 @@ float microForm(vec3 p, float h, out float dustRing){
   return prof * uMicro * 0.85;
 }
 
-/* Returns: x = density, y = dust fraction, z = ash fraction. */
-vec3 sampleMedium(vec3 p, bool cheap){
+/* Returns: x = density, y = dust fraction, z = ash fraction, w = sky occlusion. */
+vec4 sampleMedium(vec3 p, bool cheap){
   float h  = hgt(p);
-  if (h < gLoH - 50.0 || h > gHiH + 50.0) return vec3(0.0);
+  if (h < gLoH - 50.0 || h > gHiH + 50.0) return vec4(0.0);
   float hf = (h - uBase) / max(uTop - uBase, 1.0);
 
   float water = 0.0, dust = 0.0, ash = 0.0;
 
   if (hf > -0.02 && hf < 1.02) water = layerForm(p, h, hf);
   water = max(water, stormForm(p, h));
-  water = max(water, lentForm(p));
+  float lent = lentForm(p);
+  water = max(water, lent);
   water = max(water, virgaForm(p, h));
   water = max(water, fogForm(p, h));
   if (uCirrus > 0.0){                       // thin ice veil well above the deck
@@ -627,7 +635,7 @@ vec3 sampleMedium(vec3 p, bool cheap){
   ash = ashForm(p, h);
 
   float form = max(max(water, dust), ash);
-  if (form <= 0.02) return vec3(0.0);
+  if (form <= 0.02) return vec4(0.0);
 
   // Shape volume, advected with the wind so detail travels with the air.
   vec3 wp = p;
@@ -641,20 +649,46 @@ vec3 sampleMedium(vec3 p, bool cheap){
   }
   vec3 sp = (wp - vec3(uWind.x, 0.0, uWind.y) * uTime) * 0.00019;
   vec4 sn = texture(uShape, sp);
-  float shape = sn.r * 0.85 + sn.g * 0.15;
-  float d = remap(shape, 1.0 - form, 1.0, 0.0, 1.0);
-  if (d <= 0.0) return vec3(0.0);
+  float d = remap(sn.r, 1.0 - form, 1.0, 0.0, 1.0);
+  if (d <= 0.0) return vec4(0.0);
 
+  float keep = 1.0 - form * 0.22;          // dense cores keep their mass
+  // Lens clouds form in laminar flow. Eroding them with turbulence noise is
+  // exactly wrong — it is why they look smooth and cut from soap in real life.
+  keep *= 1.0 - clamp(lent / max(form, 1e-4), 0.0, 1.0) * 0.88;
   if (!cheap){
-    vec3 dp = (wp - vec3(uWind.x, 0.0, uWind.y) * uTime * 1.4) * 0.0016;
+    // Medium erosion, taken from the shape volume's own Worley octaves rather
+    // than a third texture: cauliflower up top, filaments down at the base.
+    float mid = sn.b * 0.62 + sn.a * 0.38;
+    mid = mix(mid, 1.0 - mid, clamp(hf * 2.4, 0.0, 1.0));
+    d = remap(d, mid * 0.34 * keep, 1.0, 0.0, 1.0);
+    if (d <= 0.0) return vec4(0.0);
+
+    // Fine erosion, swirled so edges churn instead of sliding downwind rigidly
+    // with the body of the cloud.
+    vec3 dp = wp * 0.0021;
+    dp.xz += vec2(sin(wp.y * 0.0013 + uTime * 0.12),
+                  cos(wp.x * 0.0009 - uTime * 0.10)) * 0.55;
+    dp -= vec3(uWind.x, 0.0, uWind.y) * (uTime * 0.0027);
     vec3 dn = texture(uDetail, dp).rgb;
     float det = dn.r * 0.625 + dn.g * 0.25 + dn.b * 0.125;
-    det = mix(det, 1.0 - det, clamp(hf * 2.2, 0.0, 1.0));    // wispy below, billowy above
-    d = remap(d, det * 0.42 * (1.0 - form * 0.55), 1.0, 0.0, 1.0);
+    det = mix(det, 1.0 - det, clamp(hf * 2.2, 0.0, 1.0));
+    d = remap(d, det * 0.30 * keep, 1.0, 0.0, 1.0);
   }
   d = clamp(d, 0.0, 1.0) * uDensity;
+
+  // How much medium is stacked overhead: a parcel near the base of a deep tower
+  // sees almost no sky, which is why storm bases are dark and flat-lit. Measured
+  // against the top of whatever this sample belongs to, so a shallow fog bank
+  // is not shaded like a 14 km cumulonimbus.
+  float mTop = (hf > 1.0 && uSuper > 0.0) ? uEL : uTop;
+  float span = max(mTop - uBase, 200.0);
+  float ao = 1.0;
+  if (h > uBase - 20.0)
+    ao = exp(-form * clamp((mTop - h) / span, 0.0, 1.0) * span * 0.0016);
+
   float tot = max(water + dust + ash, 1e-4);
-  return vec3(d, dust / tot, ash / tot);
+  return vec4(d, dust / tot, ash / tot, ao);
 }
 
 /* Cloud shadow for terrain and light shafts: one lookup at the height where the
@@ -730,10 +764,17 @@ float dualPhase(float c, float gF, float gB){
   return mix(hg(c, gB), hg(c, gF), 0.55) * 4.0 * PI;
 }
 
+// A straight line of taps keeps hitting the same filament and bands the
+// shading; spreading them into a cone costs nothing and softens it.
+const vec3 kCone[6] = vec3[6](
+  vec3( 0.10, 0.22, -0.18), vec3(-0.26, 0.05,  0.24),
+  vec3( 0.31,-0.19,  0.08), vec3(-0.12,-0.28, -0.21),
+  vec3( 0.22, 0.30,  0.26), vec3(-0.33, 0.14, -0.09));
+
 float lightMarch(vec3 p){
   float d = 0.0, t = 0.0, dt = 70.0;
   for (int i = 0; i < 6; i++){
-    vec3 q = p + uSun * (t + dt * 0.5);
+    vec3 q = p + uSun * (t + dt * 0.5) + kCone[i] * dt * 0.9;
     d += sampleMedium(q, true).x * dt;
     t += dt; dt *= 1.65;
   }
@@ -770,7 +811,7 @@ vec4 marchClouds(vec3 ro, vec3 rd, float tMax, float jitter, out float meanT){
     if (i >= uSteps || t > t1 || tr < 0.02) break;
     float dt = max(dtBase, t * 0.035);
     vec3  p  = ro + rd * t;
-    vec3  m  = sampleMedium(p, cheap);
+    vec4  m  = sampleMedium(p, cheap);
 
     if (cheap){
       if (m.x > 0.0){ cheap = false; t -= dt * 0.6; continue; }
@@ -789,7 +830,10 @@ vec4 marchClouds(vec3 ro, vec3 rd, float tMax, float jitter, out float meanT){
     float hf    = clamp((hgt(p) - uBase) / max(uTop - uBase, 1.0), 0.0, 1.0);
 
     // Three energy-attenuated octaves stand in for multiple scattering.
+    // Powder darkens edges that are lit from behind — apply it toward the sun,
+    // where it reads, and not on the lit flank, where it only muddies.
     float powder = 1.0 - exp(-m.x * sigma * 900.0);
+    powder = mix(1.0, powder, 0.42 + 0.48 * clamp(cosT * 0.5 + 0.5, 0.0, 1.0));
     vec3 lum = vec3(0.0);
     for (int o = 0; o < 3; o++){
       float fo = float(o);
@@ -798,7 +842,7 @@ vec4 marchClouds(vec3 ro, vec3 rd, float tMax, float jitter, out float meanT){
       float phase = dualPhase(cosT, 0.82 * cn, -0.28 * cn);
       lum += sunC * beer * phase * bn;
     }
-    lum *= mix(1.0, powder, 0.62);
+    lum *= mix(1.0, powder, 0.85);
     lum *= mix(1.0, 0.72, m.z);                       // ash barely multiple-scatters
 
     if (uFlash > 0.0){                                 // discharge lights the cloud from inside
@@ -810,7 +854,7 @@ vec4 marchClouds(vec3 ro, vec3 rd, float tMax, float jitter, out float meanT){
       lum += vec3(1.0, 0.72, 0.30) * 4.0e6 / (dot(dl, dl) + 4.0e4);
     }
 
-    vec3  amb = ambientAt(hf) * 0.38 * mix(1.0, 0.60, m.z);
+    vec3  amb = ambientAt(hf) * 0.44 * mix(0.22, 1.0, m.w) * mix(1.0, 0.60, m.z);
     float ext = sigma * m.x;
     float sT  = exp(-ext * dt);
     vec3  S   = alb * ext * (lum + amb);
@@ -1135,7 +1179,7 @@ gl.bindVertexArray(vao);
 const drawQuad = () => gl.drawArrays(gl.TRIANGLES, 0, 3);
 
 /* ══════════════════════════ 3-D noise volumes ══════════════════════════ */
-function makeVolume(size, mode) {
+function newVolume(size) {
   const tex = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_3D, tex);
   gl.texStorage3D(gl.TEXTURE_3D, 1, gl.RGBA8, size, size, size);
@@ -1144,27 +1188,42 @@ function makeVolume(size, mode) {
   gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.REPEAT);
   gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.REPEAT);
   gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.REPEAT);
-
-  const fbo = gl.createFramebuffer();
-  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-  gl.useProgram(progNoise);
-  gl.uniform1f(progNoise.u.uSize, size);
-  gl.uniform1i(progNoise.u.uMode, mode);
-  gl.viewport(0, 0, size, size);
-  for (let z = 0; z < size; z++) {
-    gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, tex, 0, z);
-    gl.uniform1f(progNoise.u.uLayer, (z + 0.5) / size);
-    drawQuad();
-  }
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  gl.deleteFramebuffer(fbo);
   return tex;
 }
 
-boot("baking cloud shape volume…", 0.35);
-const texShape  = makeVolume(64, 0);
-boot("baking erosion detail volume…", 0.7);
-const texDetail = makeVolume(32, 1);
+// Baked a few layers per frame: the progress bar stays live and no single
+// draw batch is long enough to trip a driver watchdog on a weak GPU.
+function bakeVolume(tex, size, mode, label, from, to, done) {
+  const fbo = gl.createFramebuffer();
+  let z = 0, perChunk = 4;
+  (function chunk() {
+    const t0 = performance.now();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.useProgram(progNoise);
+    gl.uniform1f(progNoise.u.uSize, size);
+    gl.uniform1i(progNoise.u.uMode, mode);
+    gl.viewport(0, 0, size, size);
+    const end = Math.min(size, z + perChunk);
+    for (; z < end; z++) {
+      gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, tex, 0, z);
+      gl.uniform1f(progNoise.u.uLayer, (z + 0.5) / size);
+      drawQuad();
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    boot(label, from + (to - from) * (z / size));
+    // Size the next chunk from how long this one took, so a slow GPU still
+    // repaints the progress bar instead of appearing to hang.
+    const ms = performance.now() - t0;
+    if (ms > 90) perChunk = Math.max(1, perChunk >> 1);
+    else if (ms < 20) perChunk = Math.min(16, perChunk * 2);
+    if (z < size) requestAnimationFrame(chunk);
+    else { gl.deleteFramebuffer(fbo); done(); }
+  })();
+}
+
+const SHAPE_N = 96, DETAIL_N = 48;
+const texShape  = newVolume(SHAPE_N);
+const texDetail = newVolume(DETAIL_N);
 
 /* ══════════════════════════ accumulation targets ══════════════════════════ */
 let rtW = 0, rtH = 0, rts = [null, null], fbos = [null, null], cur = 0;
@@ -1775,13 +1834,18 @@ function frame(now){
 function fmtM(v){ return v >= 1000 ? (v / 1000).toFixed(2) + " km" : Math.round(v) + " m"; }
 
 /* ══════════════════════════ go ══════════════════════════ */
-boot("ready", 1);
 applyScenario(SCENARIOS[0]);
-setTimeout(() => {
-  document.getElementById("boot").classList.add("hidden");
-  document.getElementById("menu").classList.remove("hidden");
-}, 260);
-requestAnimationFrame(frame);
+bakeVolume(texShape, SHAPE_N, 0, "baking cloud shape volume…", 0.12, 0.78, () => {
+  bakeVolume(texDetail, DETAIL_N, 1, "baking erosion detail…", 0.78, 1.0, () => {
+    boot("ready", 1);
+    setTimeout(() => {
+      document.getElementById("boot").classList.add("hidden");
+      document.getElementById("menu").classList.remove("hidden");
+    }, 220);
+    last = performance.now();
+    requestAnimationFrame(frame);
+  });
+});
 })();
 </script>
 </body>
