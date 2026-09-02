@@ -438,7 +438,7 @@ float heightGradient(float hf, float st, float tall){
 
 /* Layered cloud coverage as a 0..1 "how much cloud wants to be here" field. */
 float layerForm(vec3 p, float h, float hf){
-  vec2 q = p.xz - uWind * uTime - gWindDir * max(h - uBase, 0.0) * uShear * 0.22;
+  vec2 q = p.xz - uWind * uTime - gWindDir * max(h - uBase, 0.0) * 0.001 * uShear * 55.0;
 
   if (uFuji > 0.0){                        // two orbiting circulations shear the deck
     for (int i = 0; i < 2; i++){
@@ -474,7 +474,7 @@ float layerForm(vec3 p, float h, float hf){
 float stormForm(vec3 p, float h, out float ice, out float anvTop){
   ice = 0.0; anvTop = 0.0;
   if (uSuper <= 0.0) return 0.0;
-  vec2 ax = uStorm + gWindDir * max(h - uBase, 0.0) * uShear * 0.30;
+  vec2 ax = uStorm + gWindDir * max(h - uBase, 0.0) * 0.001 * uShear * 70.0;
   vec2 d2 = p.xz - ax;
   float r = length(d2);
 
@@ -483,8 +483,8 @@ float stormForm(vec3 p, float h, out float ice, out float anvTop){
 
   // Updraft tower: boiling, cauliflower, and it stops at the condensation level.
   float colProf = smoothstep(uBase - 40.0, uBase + 460.0, h) * smoothstep(colTop + 900.0, colTop - 3000.0, h);
-  float colR    = core * (0.45 + 1.15 * smoothstep(uBase, colTop, h));
-  float col     = smoothstep(colR, colR * 0.28, r) * colProf;
+  float colR    = core * (0.85 + 1.15 * smoothstep(uBase, colTop, h));
+  float col     = smoothstep(colR, colR * 0.62, r) * colProf;
 
   // The canopy. An elliptical cross-section gives the sharp thin rim that a
   // linear taper never does, and it is what the eye reads as "anvil".
@@ -493,11 +493,11 @@ float stormForm(vec3 p, float h, out float ice, out float anvTop){
   // its rim is scalloped rather than turned on a lathe.
   vec2  wa = vec2(dot(ad, gWindDir) / 1.35, dot(ad, vec2(-gWindDir.y, gWindDir.x)));
   float ang  = atan(wa.y, wa.x);
-  float anvR = core * 5.0 * (0.80 + 0.42 * fbm2c(vec2(cos(ang), sin(ang)) * 1.8 + 7.3));
+  float anvR = core * 3.7 * (0.80 + 0.42 * fbm2c(vec2(cos(ang), sin(ang)) * 1.8 + 7.3));
   float u    = length(wa) / anvR;
-  float lens = pow(max(1.0 - u * u, 0.0), 0.35);
+  float lens = pow(max(1.0 - u * u, 0.0), 0.42);
   float mid  = colTop + 400.0;
-  float thick = 5200.0 * lens;
+  float thick = 6200.0 * lens;
   float aT    = mid + thick * 0.64;
   float aB    = mid - thick * 0.36;
   float anvil = smoothstep(aT, aT - 520.0, h) * smoothstep(aB, aB + 460.0, h);
@@ -506,9 +506,10 @@ float stormForm(vec3 p, float h, out float ice, out float anvTop){
 
   // Overshooting top: the one rough thing on the canopy, punched through the
   // ice by an updraft that outran its own buoyancy. Sits upwind of centre.
-  vec2  oc  = uStorm - gWindDir * 1600.0;
+  vec2  axTop = uStorm + gWindDir * max(mid - uBase, 0.0) * 0.001 * uShear * 70.0;
+  vec2  oc  = axTop - gWindDir * 2200.0;
   float ro  = length(p.xz - oc);
-  float ovR = core * 1.05;
+  float ovR = core * 1.20;
   float ov  = smoothstep(ovR, ovR * 0.30, ro)
             * smoothstep(aT + 3000.0, aT - 1100.0, h) * step(aB, h) * 0.95;
 
@@ -517,15 +518,29 @@ float stormForm(vec3 p, float h, out float ice, out float anvTop){
   float wall = smoothstep(2200.0, 700.0, r) * smoothstep(lower, lower + 320.0, h)
              * smoothstep(uBase + 2200.0, uBase + 400.0, h) * 0.8;
 
+  // Precipitation shelf: the rain-filled underbelly and flanking line spread
+  // far wider than the updraft that feeds them, which is what makes a supercell
+  // bottom-heavy rather than a mushroom on a stalk.
+  vec2  sd = d2 - gWindDir * 2600.0;          // precipitation falls downwind
+  float sr = length(vec2(dot(sd, gWindDir) / 1.25, dot(sd, vec2(-gWindDir.y, gWindDir.x))));
+  float shelfR = core * 2.4 * (0.85 + 0.30 * fbm2c(sd * 0.00009 + 4.7));
+  // The rain-free base: the updraft is drawing air up, so nothing falls through
+  // it. This notch is the reason a tornado is ever visible from the ground.
+  float rainFree = smoothstep(1700.0, 4300.0, r);
+  float shelf = smoothstep(shelfR, shelfR * 0.55, sr) * rainFree
+              * smoothstep(uBase - 120.0, uBase + 520.0, h)
+              * smoothstep(uBase + 4200.0, uBase + 900.0, h) * 0.82;
+
   // Turbulence belongs to the convective parts, not to the frozen canopy.
   float turb = 0.66 + 0.66 * fbm2c(d2 * 0.00034 + vec2(h * 0.00022, uTime * 0.006));
-  col  *= turb;
-  wall *= turb;
+  col   *= turb;
+  wall  *= turb;
+  shelf *= turb;
   ov   *= 0.80 + 0.35 * turb;
   anvil *= 0.96 + 0.08 * turb;
 
-  float total = max(max(col, anvil), max(ov, wall));
-  if (total > 1e-4) ice = clamp((anvil - max(ov, col) * 1.2) / total, 0.0, 1.0);
+  float total = max(max(col, anvil), max(max(ov, wall), shelf));
+  if (total > 1e-4) ice = clamp((anvil - max(max(ov, col), shelf) * 1.2) / total, 0.0, 1.0);
   anvTop = aT;
   return clamp(total * uSuper * 0.94, 0.0, 1.0);
 }
@@ -1112,7 +1127,7 @@ void main(){
   gLoH = 0.0;
   if (uVirga <= 0.0 && uTorn <= 0.0 && uHaboob <= 0.0 && uMicro <= 0.0 && uAsh <= 0.0 && uLent <= 0.0 && uFogD <= 0.0)
     gLoH = max(0.0, uBase - 300.0);
-  gHiH = max(uTop, uEL + 3400.0);
+  gHiH = max(uTop, uEL + 5400.0);
   if (uFogD > 0.0) gHiH = max(gHiH, uFogTop * 1.6);
   if (uAsh   > 0.0) gHiH = max(gHiH, 16500.0);
   if (uCirrus > 0.0) gHiH = max(gHiH, uTop);
@@ -1331,7 +1346,7 @@ const EASED = ["virga","fog","halo","glory","pillar","lent","cavum","super","tor
 const A = {}; EASED.forEach(k => A[k] = S[k]);
 
 const QUALITY = [
-  { name: "Low",  steps: 64,  scale: 0.42, sharp: 0.5 },
+  { name: "Low",  steps: 72,  scale: 0.42, sharp: 0.5 },
   { name: "Med",  steps: 88,  scale: 0.58, sharp: 0.4 },
   { name: "High", steps: 140, scale: 0.78, sharp: 0.3 },
   { name: "Ultra",steps: 200, scale: 1.00, sharp: 0.2 }
@@ -1469,18 +1484,18 @@ const SCENARIOS = [
     storm:[6000,9000], cam:[0,2950,-9000], look:[0,1650,4000] },
 
   { id:"super", hue:"var(--b)", name:"Supercell", tag:"Tier B · rotating storm", g:G.super,
-    desc:"3200 J/kg of CAPE under 25 m/s of shear, seen level with the anvil. Smooth glaciated canopy, rough overshooting top, rotating base.",
+    desc:"3200 J/kg of CAPE under 25 m/s of shear, from 30 km out. Broad glaciated canopy, rough overshooting top, wide rain-filled base.",
     set:{ dewDep:8, cape:3200, coverage:0.30, stratus:0, cirrus:0, windSpd:15, windDir:200, shear:7,
-          sunElev:19, sunAz:255, haze:0.55, terrain:300, ground:0.35, snow:6000, sea:-400,
+          sunElev:26, sunAz:250, haze:0.33, terrain:300, ground:0.35, snow:6000, sea:-400,
           virga:1,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:1,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
-    storm:[4000,6000], cam:[-13000,12600,-15000], look:[4000,14100,6000] },
+    storm:[4000,6000], cam:[-20000,2400,-23000], look:[4000,8600,6000] },
 
   { id:"torn", hue:"var(--b)", name:"Tornado", tag:"Tier B · condensation funnel", g:G.torn,
     desc:"A low condensation level lets the funnel reach the ground. Raise the dew-point depression and it lifts.",
     set:{ dewDep:6, cape:3600, coverage:0.22, stratus:0, cirrus:0, windSpd:14, windDir:200, shear:8,
-          sunElev:13, sunAz:255, haze:0.6, terrain:140, ground:0.4, snow:6000, sea:-400,
+          sunElev:17, sunAz:255, haze:0.5, terrain:140, ground:0.4, snow:6000, sea:-400,
           virga:1,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:1,torn:1,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
-    storm:[1200,2200], cam:[-1500,300,-1900], look:[1200,820,2200] },
+    storm:[1200,2200], cam:[-600,330,-2900], look:[1200,900,2200] },
 
   { id:"haboob", hue:"var(--b)", name:"Haboob", tag:"Tier B · density current", g:G.haboob,
     desc:"A gravity current running out ahead of a dying storm, lofting a wall of dust with a rolling head.",
