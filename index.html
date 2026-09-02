@@ -345,6 +345,7 @@ uniform float uFlash;
 uniform vec3  uFlashP;
 uniform vec4  uBall;
 uniform float uTerrain, uGround, uSnow, uSea;
+uniform vec4  uTurret[9];   // xy = offset from axis, z = centre height, w = radius
 
 const float R  = 6371000.0;
 const float PI = 3.14159265359;
@@ -498,10 +499,25 @@ float stormForm(vec3 p, float h, out float ice, out float anvTop){
   float colTop = uEL;
   float core   = 4200.0;
 
-  // Updraft tower: boiling, cauliflower, and it stops at the condensation level.
+  // Updraft tower. An updraft is not one smooth cone: it is a cluster of
+  // bubbles, each rising to its own height and collapsing back, which is what
+  // gives a real tower its stepped, knobbly, one-sided profile. The trunk only
+  // binds them together.
   float colProf = smoothstep(uBase - 40.0, uBase + 460.0, h) * smoothstep(colTop + 900.0, colTop - 3000.0, h);
-  float colR    = core * (0.85 + 1.15 * smoothstep(uBase, colTop, h));
-  float col     = smoothstep(colR, colR * 0.62, r) * colProf;
+  float colR    = core * (0.48 + 0.54 * smoothstep(uBase, colTop, h));
+  float trunk   = smoothstep(colR, colR * 0.62, r) * colProf;
+
+  // Each bubble is a rounded blob, not a cylinder with a lid — flat tops union
+  // into a slab, which is exactly what a boiling tower is not.
+  float cluster = 0.0;
+  for (int i = 0; i < 9; i++){
+    vec4 T = uTurret[i];
+    if (T.w < 1.0) continue;
+    vec3 q = vec3(d2.x - T.x, (h - T.z) * 0.78, d2.y - T.y);
+    cluster = max(cluster, smoothstep(T.w, T.w * 0.72, length(q)));
+  }
+  cluster *= smoothstep(uBase - 40.0, uBase + 420.0, h);
+  float col = max(trunk, cluster);
 
   // The canopy. An elliptical cross-section gives the sharp thin rim that a
   // linear taper never does, and it is what the eye reads as "anvil".
@@ -510,7 +526,13 @@ float stormForm(vec3 p, float h, out float ice, out float anvTop){
   // its rim is scalloped rather than turned on a lathe.
   vec2  wa = vec2(dot(ad, gWindDir) / 1.35, dot(ad, vec2(-gWindDir.y, gWindDir.x)));
   float ang  = atan(wa.y, wa.x);
-  float anvR = core * 3.7 * (0.80 + 0.42 * fbm2c(vec2(cos(ang), sin(ang)) * 1.8 + 7.3));
+  // Outflow is dragged out downwind: the canopy carries a long fibrous tail on
+  // the lee side rather than closing into an ellipse.
+  float dw   = dot(normalize(ad + vec2(1e-4)), gWindDir);
+  float tail = 1.0 + 0.95 * smoothstep(0.10, 1.0, dw);
+  float anvR = core * 3.5 * tail
+             * (0.78 + 0.44 * fbm2c(vec2(cos(ang), sin(ang)) * 1.8 + 7.3)
+                     + 0.18 * fbm2c(vec2(cos(ang), sin(ang)) * 6.5 + 2.1));
   float u    = length(wa) / anvR;
   float lens = pow(max(1.0 - u * u, 0.0), 0.42);
   float mid  = colTop + 400.0;
@@ -520,6 +542,9 @@ float stormForm(vec3 p, float h, out float ice, out float anvTop){
   float anvil = smoothstep(aT, aT - 520.0, h) * smoothstep(aB, aB + 460.0, h);
   // Faint radial striations, the way the outflow actually spreads.
   anvil *= 0.94 + 0.06 * sin(u * 30.0 + ang * 3.0);
+  // The outer canopy frays into radial streamers instead of ending at a wall.
+  float fib = 0.42 + 0.85 * fbm2c(vec2(ang * 3.2, u * 4.5) + 13.0);
+  anvil *= mix(1.0, fib, smoothstep(0.48, 1.0, u));
 
   // Overshooting top: the one rough thing on the canopy, punched through the
   // ice by an updraft that outran its own buoyancy. Sits upwind of centre.
@@ -1678,6 +1703,35 @@ function boltAmp(bl) {
   return Math.min(a, 1.7) * (0.7 + 0.3 * Math.sin(bl.age * 120.0));
 }
 
+/* ══════════════════════════ updraft turrets ══════════════════════════ */
+/* Each bubble rises, tops out and collapses on its own clock, so the tower is
+   never symmetric and never the same shape twice. */
+const TURRETS = [];
+for (let i = 0; i < 9; i++)
+  TURRETS.push({ ph: Math.random(), sp: 0.010 + Math.random() * 0.020,
+                 ang: Math.random() * 6.283,
+                 // bubbles stack up the tower, spreading wider the higher they sit
+                 hFrac: 0.10 + (i / 9) * 0.86 + Math.random() * 0.08,
+                 // offsets have to exceed the bubble radii or the cluster
+                 // just averages back into an axisymmetric column
+                 spread: 0.55 + Math.random() * 0.85,
+                 rad: 0.40 + Math.random() * 0.26 });
+const turretBuf = new Float32Array(36);
+function updateTurrets(t) {
+  const core = 4200, span = derived.EL - derived.base;
+  for (let i = 0; i < 9; i++) {
+    const T = TURRETS[i];
+    const cyc = (t * T.sp + T.ph) % 1;
+    const amp = Math.sin(cyc * Math.PI);          // born, peaks, dies back
+    const ang = T.ang + t * 0.014;
+    const d   = T.spread * T.hFrac * core;
+    turretBuf[i * 4]     = Math.cos(ang) * d;
+    turretBuf[i * 4 + 1] = Math.sin(ang) * d;
+    turretBuf[i * 4 + 2] = derived.base + span * T.hFrac * (0.78 + 0.30 * amp);
+    turretBuf[i * 4 + 3] = core * T.rad * (0.58 + 0.52 * amp);
+  }
+}
+
 /* ══════════════════════════ storm motion ══════════════════════════ */
 function windUnit() {
   const w = derived.wind, L = Math.hypot(w[0], w[1]);
@@ -2239,6 +2293,7 @@ function setUniforms(b){
   gl.uniform1f(u.uGround, S.ground);
   gl.uniform1f(u.uSnow, S.snow);
   gl.uniform1f(u.uSea, S.sea);
+  gl.uniform4fv(u["uTurret[0]"], turretBuf);
 }
 
 function frame(now){
@@ -2257,6 +2312,7 @@ function frame(now){
     else A[k] = S[k];
   }
   recompute();
+  updateTurrets(tSim);
   if (!frozen) stepEvents(dt, tSim);
   const camMoved = moveCamera(dt);
 
@@ -2274,7 +2330,7 @@ function frame(now){
   const rainAmt = inMenu ? 0 : rainAtCamera();
   audioFrame(dt, rainAmt, camMoved ? Math.min(1, cam.speed / 900) : 0);
   const busy = camMoved || easing || ev.flash > 0.02 || (A.ball > 0.02)
-             || (S.drift > 0.5 && A.super > 0.02) || bolts.length > 0;
+             || (S.drift > 0.5 && A.super > 0.02) || bolts.length > 0 || A.super > 0.02;
   if (busy) accum = 0; else accum++;
   const fast = Math.max(A.torn, A.micro, A.haboob, A.ash, A.super * 0.5);
   const floor = frozen ? 0.03 : 0.06 + 0.22 * fast + Math.min(0.12, S.windSpd * 0.004);
