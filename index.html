@@ -134,6 +134,16 @@ input[type=range]::-moz-range-thumb{width:11px;height:11px;border-radius:50%;bac
   border:1px solid var(--line);color:var(--mute)}
 .seg button[aria-pressed="true"]{color:#05070c;background:var(--a);border-color:var(--a)}
 
+#scope{position:fixed;right:12px;bottom:12px;z-index:4;border:1px solid var(--line);
+  background:var(--glass);backdrop-filter:blur(8px);padding:7px 7px 5px}
+#scope.off{display:none}
+#scope canvas{display:block;width:180px;height:180px;image-rendering:auto}
+.scopefoot{display:flex;justify-content:space-between;gap:10px;margin-top:5px;
+  font-family:"JetBrains Mono",monospace;font-size:9px;letter-spacing:.12em;color:var(--mute)}
+.scopefoot span:last-child{color:var(--a)}
+body.touch #scope{display:none}
+@media (max-width:760px){ #scope{display:none} }
+
 #hint{position:fixed;left:50%;bottom:12px;transform:translateX(-50%);z-index:4;
   font-family:"JetBrains Mono",monospace;font-size:10.5px;color:var(--mute);
   background:var(--glass);border:1px solid var(--line-2);padding:6px 12px;backdrop-filter:blur(6px);
@@ -202,17 +212,24 @@ body.touch #hint{display:none}
   </div>
 
   <div id="hud" aria-live="off">
+    <span class="k">range</span><span class="v" id="hRange">—</span>
+    <span class="k">bearing</span><span class="v" id="hBear">—</span>
+    <span class="k">storm mot</span><span class="v" id="hMot">—</span>
     <span class="k">alt</span><span class="v" id="hAlt">—</span>
     <span class="k">cloud base</span><span class="v" id="hBase">—</span>
     <span class="k">tops</span><span class="v" id="hTop">—</span>
     <span class="k">w max</span><span class="v" id="hW">—</span>
-    <span class="k">sun</span><span class="v" id="hSun">—</span>
     <span class="k">fps</span><span class="v" id="hFps">—</span>
+  </div>
+
+  <div id="scope" aria-label="Reflectivity scope">
+    <canvas id="radar" width="180" height="180"></canvas>
+    <div class="scopefoot"><span id="radRange">40 km</span><span id="radMode">REFLECTIVITY</span></div>
   </div>
 
   <aside id="panel" aria-label="Atmosphere controls"></aside>
 
-  <div id="hint">drag to look · W A S D fly · Q E up/down · Shift boost · scroll speed</div>
+  <div id="hint">drag to look · W A S D fly · Q E up/down · Shift boost · scroll speed · <b>F</b> chase lock · <b>R</b> radar</div>
 
   <div id="pads" aria-hidden="true">
     <button data-pad="up">&#9650;</button><button data-pad="fwd">&#8593;</button><button data-pad="down">&#9660;</button>
@@ -917,7 +934,7 @@ vec4 marchClouds(vec3 ro, vec3 rd, float tMax, float jitter, out float meanT){
 
     if (uFlash > 0.0){                                 // discharge lights the cloud from inside
       vec3 dl = uFlashP - p;
-      lum += vec3(1.0, 0.94, 0.82) * uFlash * 9.0e7 / (dot(dl, dl) + 2.0e5);
+      lum += vec3(1.0, 0.94, 0.82) * uFlash * 3.2e7 / (dot(dl, dl) + 2.0e5);
     }
     if (uBall.w > 0.0){
       vec3 dl = uBall.xyz - p;
@@ -1167,8 +1184,61 @@ void main(){
 
   col = aces(col * uExposure);
 
-  vec3 hist = texture(uHist, gl_FragCoord.xy / uRes).rgb;
-  outColor = vec4(mix(hist, col, uBlend), 1.0);
+  vec4 hist = texture(uHist, gl_FragCoord.xy / uRes);
+  // Alpha carries the cloud transmittance, so the lightning pass knows what is
+  // in front of a channel without needing a depth buffer.
+  outColor = vec4(mix(hist.rgb, col, uBlend), mix(hist.a, cl.a * trA, uBlend));
+}
+</script>
+
+<script id="vsBolt" type="x-shader/x-vertex">#version 300 es
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec3 aDir;
+layout(location = 2) in vec3 aMisc;   // x = side (-1/+1), y = half-width (m), z = brightness
+uniform vec3 uCam;
+uniform mat3 uBasis;
+uniform float uTanHalf, uAspect, uPxWorld;
+out float vSide;
+out float vBright;
+void main(){
+  vec3 rel = aPos - uCam;
+  vec3 vd  = normalize(rel);
+  // Expand the segment perpendicular to both its own run and the view ray, so
+  // the channel keeps its width whatever angle you watch it from.
+  vec3 perp = cross(aDir, vd);
+  float pl = length(perp);
+  perp = (pl > 1e-5) ? perp / pl : vec3(1.0, 0.0, 0.0);
+  // A 30 m channel at 40 km is a third of a pixel wide. Real lightning reads at
+  // that range because of glare, so hold a floor on the screen-space width and
+  // let the corona falloff do the rest.
+  float hw = max(aMisc.y, uPxWorld * length(rel) * 1.9);
+  vec3 w = rel + perp * (aMisc.x * hw);
+  vec3 v = vec3(dot(w, uBasis[0]), dot(w, uBasis[1]), dot(w, uBasis[2]));
+  float z = max(v.z, 1.0);
+  gl_Position = vec4(v.x / (z * uTanHalf * uAspect), v.y / (z * uTanHalf),
+                     v.z > 0.0 ? 0.0 : 2.0, 1.0);
+  vSide = aMisc.x;
+  vBright = aMisc.z;
+}
+</script>
+
+<script id="fsBolt" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+in float vSide;
+in float vBright;
+out vec4 outColor;
+uniform sampler2D uCloud;
+uniform vec2 uRes;
+uniform float uAmp;
+void main(){
+  float e = 1.0 - min(abs(vSide), 1.0);
+  float core = pow(e, 7.0);
+  float glow = pow(e, 1.6);
+  vec3 c = vec3(1.0, 0.97, 0.94) * core * 4.5      // the channel itself
+         + vec3(0.52, 0.66, 1.0) * glow * 1.1;     // corona around it
+  // Alpha of the cloud buffer is transmittance: a channel behind cloud dims.
+  float tr = texture(uCloud, gl_FragCoord.xy / uRes).a;
+  outColor = vec4(c * vBright * uAmp * mix(0.10, 1.0, tr), 1.0);
 }
 </script>
 
@@ -1177,7 +1247,25 @@ precision highp float;
 out vec4 outColor;
 uniform sampler2D uTex;
 uniform vec2 uRes;
-uniform float uSharp;
+uniform float uSharp, uRain, uTime;
+uniform vec2 uRainDir;
+
+float rhash(vec2 p){ return fract(sin(dot(p, vec2(41.3, 289.1))) * 43758.5453); }
+
+// One layer of wind-slanted streaks. Cells that fail the threshold stay empty,
+// so the rain reads as discrete drops rather than a screen-door pattern.
+float rainLayer(vec2 rp, float scale, float speed, float thresh, float t){
+  vec2 p = rp * scale;
+  p.y -= t * speed;
+  vec2 id = floor(p), f = fract(p);
+  float h = rhash(id);
+  if (h < thresh) return 0.0;
+  float len = 0.18 + 0.55 * fract(h * 17.3);
+  float x = abs(f.x - 0.5 + (fract(h * 91.7) - 0.5) * 0.6);
+  float y = abs(f.y - 0.5);
+  return smoothstep(0.055, 0.0, x) * smoothstep(len, len * 0.15, y);
+}
+
 void main(){
   vec2 uv = gl_FragCoord.xy / uRes;
   vec3 c = texture(uTex, uv).rgb;
@@ -1187,6 +1275,20 @@ void main(){
            + texture(uTex, uv + vec2(0.0, px.y)).rgb + texture(uTex, uv - vec2(0.0, px.y)).rgb;
     c = clamp(c + (c * 4.0 - b) * uSharp * 0.25, 0.0, 1.0);
   }
+  if (uRain > 0.001){
+    // Work in a frame aligned with the fall direction so the streaks slant with
+    // the wind instead of always running straight down the screen.
+    vec2 asp = vec2(uRes.x / uRes.y, 1.0);
+    vec2 d  = normalize(uRainDir);
+    vec2 q  = uv * asp;
+    vec2 rp = vec2(dot(q, vec2(d.y, -d.x)), dot(q, d));
+    float s = rainLayer(rp, 34.0, 2.6, 0.90 - uRain * 0.14, uTime) * 0.9
+            + rainLayer(rp, 21.0, 1.7, 0.92 - uRain * 0.12, uTime * 0.83 + 3.1) * 0.7
+            + rainLayer(rp, 13.0, 1.1, 0.94 - uRain * 0.10, uTime * 0.61 + 7.7) * 0.5;
+    c += vec3(0.62, 0.70, 0.82) * s * uRain;
+    c = mix(c, vec3(0.34, 0.38, 0.44), uRain * 0.13);      // the air itself greys out
+  }
+
   // Subtle filmic grain keeps the low-resolution march from banding.
   float g = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
   outColor = vec4(c + (g - 0.5) * 0.006, 1.0);
@@ -1237,12 +1339,13 @@ function program(vsSrc, fsSrc, name) {
 }
 const src = id => document.getElementById(id).textContent;
 
-let progMain, progNoise, progPresent;
+let progMain, progNoise, progPresent, progBolt;
 try {
   boot("compiling atmosphere shader…", 0.1);
   progNoise   = program(src("vs"), src("fsNoise"),   "noise");
   progMain    = program(src("vs"), src("fsMain"),    "main");
   progPresent = program(src("vs"), src("fsPresent"), "present");
+  progBolt    = program(src("vsBolt"), src("fsBolt"), "bolt");
 } catch (e) {
   document.getElementById("boot").innerHTML =
     '<div class="bootbox"><h1>Aeo<span>lus</span></h1><p class="fail">Shader compilation failed on this GPU.<br><br>' +
@@ -1297,6 +1400,18 @@ function bakeVolume(tex, size, mode, label, from, to, done) {
   })();
 }
 
+const boltVAOo = gl.createVertexArray();
+const boltVBOo = gl.createBuffer();
+(function setupBolt(){
+  gl.bindVertexArray(boltVAOo);
+  gl.bindBuffer(gl.ARRAY_BUFFER, boltVBOo);
+  const st = 9 * 4;
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, st, 0);
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, st, 12);
+  gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 3, gl.FLOAT, false, st, 24);
+  gl.bindVertexArray(vao);
+})();
+
 const SHAPE_N = 96, DETAIL_N = 48;
 const texShape  = newVolume(SHAPE_N);
 const texDetail = newVolume(DETAIL_N);
@@ -1337,6 +1452,7 @@ const S = {
   virga: 0, fog: 0, halo: 0, glory: 0, pillar: 0, lent: 0, cavum: 0,
   super: 0, torn: 0, micro: 0, haboob: 0, ash: 0, fuji: 0,
   sprite: 0, nlc: 0, ball: 0,
+  drift: 1, chase: 0, ltg: 1, sound: 0, scope: 1,
   quality: 1
 };
 // Phenomena ease in and out instead of popping, which also gives the
@@ -1393,19 +1509,26 @@ const ev = { flash: 0, flashPos: [0, 3000, 0], nextFlash: 2, front: -14000,
 let stormXZ = [6000, 9000];
 
 function stepEvents(dt, t) {
-  // Lightning: rate follows how convective the scene actually is.
-  const rate = A.super * 0.9 + A.ash * 1.4;
+  // A storm is steered by the flow it grows in, so it can be chased or lost.
+  if (S.drift > 0.5) {
+    const m = stormMotionVec();
+    stormXZ[0] += m[0] * dt; stormXZ[1] += m[1] * dt;
+    if (S.chase > 0.5) { cam.pos[0] += m[0] * dt; cam.pos[2] += m[1] * dt; }
+  }
+
+  // Flash rate follows how convective the scene actually is; each flash is a
+  // real channel with its own geometry and its own thunder.
+  const rate = (A.super * 0.9 + A.ash * 1.4) * (S.ltg > 0.5 ? 1 : 0);
   if (rate > 0.05) {
     ev.nextFlash -= dt * rate;
     if (ev.nextFlash <= 0) {
-      ev.nextFlash = 0.5 + Math.random() * 3.0;
-      ev.flash = 1;
-      const r = 2600 * Math.sqrt(Math.random());
-      const a = Math.random() * 6.283;
-      ev.flashPos = [stormXZ[0] + Math.cos(a) * r,
-                     derived.base + Math.random() * (derived.EL - derived.base) * 0.6,
-                     stormXZ[1] + Math.sin(a) * r];
+      ev.nextFlash = 0.45 + Math.random() * 2.6;
+      spawnStrike();
     }
+  }
+  for (let i = bolts.length - 1; i >= 0; i--) {
+    bolts[i].age += dt;
+    if (bolts[i].age > bolts[i].life + 0.1) bolts.splice(i, 1);
   }
   ev.flash = Math.max(0, ev.flash - dt * 5.5);
   ev.front += (derived.wind[0] * 0 + S.windSpd * 1.35) * dt;   // gravity current runs faster than the wind
@@ -1461,6 +1584,194 @@ function terrainJS(px, pz){
   return jfbmc(qx * 0.5, qz * 0.5) * 310 - 34 + jfbmc(qx * 1.7, qz * 1.7) * 170 + h * smask * S.terrain;
 }
 function groundClearance(x, z){ return terrainJS(x, z) + 22; }
+
+/* ══════════════════════════ lightning channels ══════════════════════════ */
+/* A stroke is real geometry, not a screen flash: a midpoint-displaced polyline
+   from the charge region to the ground, forked, drawn as camera-facing quads
+   and dimmed by whatever cloud sits in front of it. */
+const bolts = [];
+let boltVAO = null, boltVBO = null, boltCap = 0;
+
+function jaggedPath(a, b, jag, depth) {
+  let pts = [a, b];
+  for (let it = 0; it < depth; it++) {
+    const out = [pts[0]];
+    for (let i = 0; i < pts.length - 1; i++) {
+      const p = pts[i], q = pts[i + 1];
+      const L = Math.hypot(q[0] - p[0], q[1] - p[1], q[2] - p[2]) * jag;
+      out.push([(p[0] + q[0]) * 0.5 + (Math.random() - 0.5) * L,
+                (p[1] + q[1]) * 0.5 + (Math.random() - 0.5) * L * 0.35,
+                (p[2] + q[2]) * 0.5 + (Math.random() - 0.5) * L], q);
+    }
+    pts = out;
+  }
+  return pts;
+}
+function pushPath(segs, pts, w, br) {
+  for (let i = 0; i < pts.length - 1; i++) segs.push([pts[i], pts[i + 1], w, br]);
+}
+function makeStrike(top, bot, cg) {
+  const segs = [];
+  const trunk = jaggedPath(top, bot, cg ? 0.26 : 0.40, 5);
+  pushPath(segs, trunk, cg ? 30 : 22, 1.0);
+  const nb = cg ? 3 + (Math.random() * 5 | 0) : 5 + (Math.random() * 6 | 0);
+  for (let i = 0; i < nb; i++) {
+    const k = 3 + (Math.random() * (trunk.length - 6) | 0);
+    const q = trunk[k];
+    const frac = 1 - k / trunk.length;
+    const len = 300 + Math.random() * (cg ? 1500 : 2600);
+    const a = Math.random() * 6.283;
+    const end = [q[0] + Math.cos(a) * len,
+                 q[1] - len * (cg ? 0.35 + Math.random() * 0.7 : Math.random() - 0.4),
+                 q[2] + Math.sin(a) * len];
+    pushPath(segs, jaggedPath(q, end, 0.34, 3), cg ? 15 : 12, 0.30 + 0.45 * frac);
+  }
+  return segs;
+}
+function segsToVerts(segs) {
+  const v = new Float32Array(segs.length * 54);
+  let o = 0;
+  for (let i = 0; i < segs.length; i++) {
+    const a = segs[i][0], b = segs[i][1], w = segs[i][2], br = segs[i][3];
+    let dx = b[0] - a[0], dy = b[1] - a[1], dz = b[2] - a[2];
+    const L = Math.hypot(dx, dy, dz) || 1; dx /= L; dy /= L; dz /= L;
+    const put = (p, side) => {
+      v[o++] = p[0]; v[o++] = p[1]; v[o++] = p[2];
+      v[o++] = dx;   v[o++] = dy;   v[o++] = dz;
+      v[o++] = side; v[o++] = w;    v[o++] = br;
+    };
+    put(a, -1); put(a, 1); put(b, -1);
+    put(a,  1); put(b, 1); put(b, -1);
+  }
+  return v;
+}
+function spawnStrike() {
+  const cg = Math.random() < 0.62;
+  const gw = windUnit();
+  const r = 3000 * Math.sqrt(Math.random());
+  const a = Math.random() * 6.283;
+  // Strokes come out of the charge region under the updraft and forward flank.
+  const bx = stormXZ[0] + Math.cos(a) * r - gw[0] * 1200;
+  const bz = stormXZ[1] + Math.sin(a) * r - gw[1] * 1200;
+  const topY = derived.base + (derived.EL - derived.base) * (cg ? 0.28 : 0.55) * (0.6 + Math.random() * 0.7);
+  const top = [bx, topY, bz];
+  const bot = cg
+    ? [bx + (Math.random() - 0.5) * 900, terrainJS(bx, bz), bz + (Math.random() - 0.5) * 900]
+    : [bx + (Math.random() - 0.5) * 6000, derived.base + Math.random() * 2500, bz + (Math.random() - 0.5) * 6000];
+  const strokes = [];
+  const nS = cg ? 1 + (Math.random() * 3 | 0) : 0;
+  for (let i = 0; i < nS; i++) strokes.push(0.06 + Math.random() * 0.5);
+  bolts.push({ verts: segsToVerts(makeStrike(top, bot, cg)), age: 0,
+               life: cg ? 0.55 + Math.random() * 0.6 : 0.30 + Math.random() * 0.35,
+               strokes: strokes });
+  if (bolts.length > 4) bolts.shift();
+  thunder(Math.hypot(bx - cam.pos[0], topY - cam.pos[1], bz - cam.pos[2]));
+  ev.flash = 1; ev.flashPos = [bx, topY, bz];
+}
+function boltAmp(bl) {
+  if (bl.age > bl.life) return 0;
+  let a = Math.exp(-bl.age * 6.0);
+  for (let i = 0; i < bl.strokes.length; i++) {
+    const t = bl.age - bl.strokes[i];
+    if (t > 0) a += Math.exp(-t * 11.0) * 0.85;
+  }
+  return Math.min(a, 1.7) * (0.7 + 0.3 * Math.sin(bl.age * 120.0));
+}
+
+/* ══════════════════════════ storm motion ══════════════════════════ */
+function windUnit() {
+  const w = derived.wind, L = Math.hypot(w[0], w[1]);
+  return L > 0.01 ? [w[0] / L, w[1] / L] : [1, 0];
+}
+/* Bunkers right-mover: a supercell deviates about 30° right of the mean wind at
+   roughly three-quarters of its speed. It is why chasers sit south-east of the
+   mean flow instead of straight downwind. */
+function stormMotionVec() {
+  const w = derived.wind;
+  const spd = Math.hypot(w[0], w[1]) * 0.75;
+  const brg = Math.atan2(w[0], w[1]) + (A.super > 0.4 ? 0.52 : 0.0);
+  return [Math.sin(brg) * spd, Math.cos(brg) * spd];
+}
+
+/* ══════════════════════════ precipitation ══════════════════════════ */
+function smoothstepJS(a, b, x) { const t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); }
+/* Mirror of the shelf in the shader, so the radar scope and the rain agree with
+   what is actually being rendered instead of inventing a second field. */
+function precipAt(x, z) {
+  if (A.super <= 0.03) return 0;
+  const core = 4200, gw = windUnit();
+  const dx = x - stormXZ[0], dz = z - stormXZ[1];
+  const r = Math.hypot(dx, dz);
+  const sx = dx - gw[0] * 2600, sz = dz - gw[1] * 2600;
+  const along = (sx * gw[0] + sz * gw[1]) / 1.25;
+  const across = sx * -gw[1] + sz * gw[0];
+  const sr = Math.hypot(along, across);
+  return smoothstepJS(core * 2.4, core * 2.4 * 0.55, sr) * smoothstepJS(1700, 4300, r) * A.super;
+}
+function rainAtCamera() {
+  return precipAt(cam.pos[0], cam.pos[2])
+       * (1 - smoothstepJS(derived.base, derived.base + 900, cam.pos[1]));
+}
+
+/* ══════════════════════════ audio ══════════════════════════ */
+const AU = { ctx: null, on: false };
+function audioInit() {
+  if (AU.ctx) return;
+  const C = window.AudioContext || window.webkitAudioContext;
+  if (!C) return;
+  try { AU.ctx = new C(); } catch (e) { return; }
+  AU.master = AU.ctx.createGain();
+  AU.master.gain.value = 0; AU.master.connect(AU.ctx.destination);
+  const n = Math.floor(AU.ctx.sampleRate * 2);
+  const buf = AU.ctx.createBuffer(1, n, AU.ctx.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+  AU.noise = buf;
+  const bed = (type, freq, q) => {
+    const s = AU.ctx.createBufferSource(); s.buffer = buf; s.loop = true;
+    const f = AU.ctx.createBiquadFilter(); f.type = type; f.frequency.value = freq;
+    if (q !== undefined) f.Q.value = q;
+    const g = AU.ctx.createGain(); g.gain.value = 0;
+    s.connect(f); f.connect(g); g.connect(AU.master); s.start();
+    return { f: f, g: g };
+  };
+  AU.wind = bed("lowpass", 420);
+  AU.rain = bed("bandpass", 2200, 0.55);
+}
+function thunder(distM) {
+  if (!AU.ctx || !AU.on) return;
+  const t0 = AU.ctx.currentTime + Math.min(distM / 343, 30);   // sound lags the flash
+  const far = Math.min(distM / 22000, 1);
+  const dur = 0.8 + far * 7.0;
+  const src = AU.ctx.createBufferSource(); src.buffer = AU.noise; src.loop = true;
+  const lp = AU.ctx.createBiquadFilter(); lp.type = "lowpass";
+  // Distance is a low-pass filter: the crack is lost first, the rumble carries.
+  lp.frequency.setValueAtTime(3000 - far * 2650, t0);
+  lp.frequency.linearRampToValueAtTime(Math.max(80, 620 - far * 500), t0 + dur);
+  const g = AU.ctx.createGain();
+  const peak = 0.85 / (1 + far * 4.5);
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.linearRampToValueAtTime(peak, t0 + 0.015 + far * 0.45);
+  const rolls = 2 + (Math.random() * 3 | 0);
+  for (let i = 1; i <= rolls; i++) {
+    g.gain.linearRampToValueAtTime(peak * (0.25 + Math.random() * 0.6) * (1 - i / (rolls + 2)),
+                                   t0 + dur * (i / (rolls + 1)) + Math.random() * 0.35);
+  }
+  g.gain.exponentialRampToValueAtTime(0.0004, t0 + dur);
+  src.connect(lp); lp.connect(g); g.connect(AU.master);
+  src.start(t0); src.stop(t0 + dur + 0.15);
+}
+function audioFrame(dt, rain, flying) {
+  if (!AU.ctx) return;
+  const target = AU.on ? 1 : 0;
+  AU.master.gain.value += (target - AU.master.gain.value) * Math.min(1, dt * 3);
+  if (AU.master.gain.value < 0.001) return;
+  const gust = S.windSpd + flying * 26;
+  AU.wind.g.gain.value += (Math.min(0.30, gust * 0.0085) - AU.wind.g.gain.value) * Math.min(1, dt * 2);
+  AU.wind.f.frequency.value = 260 + gust * 20;
+  AU.rain.g.gain.value += (rain * 0.26 - AU.rain.g.gain.value) * Math.min(1, dt * 2);
+}
+
 
 /* ══════════════════════════ scenarios ══════════════════════════ */
 const G = {
@@ -1540,6 +1851,97 @@ const SCENARIOS = [
     storm:[6000,9000], cam:[3000,2900,-21000], look:[-11000,4200,-9000] }
 ];
 
+
+/* ══════════════════════════ reflectivity scope ══════════════════════════ */
+/* Camera-centred, north up, 40 km range. The field is sampled from the same
+   precipitation function the renderer uses, so the hook and the rain-free notch
+   on the scope are the ones you can fly into. */
+const radarCv = document.getElementById("radar");
+const rctx = radarCv ? radarCv.getContext("2d") : null;
+const radLow = document.createElement("canvas");
+radLow.width = radLow.height = 64;
+const rlctx = radLow.getContext("2d");
+const RAD_M = 40000;
+
+const DBZ_RAMP = [[10, [10, 90, 140, 150]], [20, [24, 150, 70, 200]], [28, [48, 200, 64, 225]],
+                  [35, [235, 220, 70, 240]], [42, [240, 155, 45, 248]], [48, [226, 62, 50, 252]],
+                  [55, [165, 26, 38, 255]], [62, [214, 70, 214, 255]]];
+function dbzRGBA(v) {
+  let c = DBZ_RAMP[0][1];
+  for (let i = 0; i < DBZ_RAMP.length; i++) if (v >= DBZ_RAMP[i][0]) c = DBZ_RAMP[i][1];
+  return c;
+}
+function compass(brg) {
+  const pts = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+               "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"];
+  return pts[Math.round(((brg % 360) + 360) % 360 / 22.5) % 16];
+}
+function drawRadar() {
+  if (!rctx || S.scope < 0.5) return;
+  const W = radarCv.width, H = radarCv.height, cx = W / 2, cy = H / 2, R = W / 2 - 1;
+
+  rctx.clearRect(0, 0, W, H);
+  rctx.fillStyle = "rgba(6,10,16,0.82)";
+  rctx.beginPath(); rctx.arc(cx, cy, R, 0, 6.2832); rctx.fill();
+
+  const N = 64, img = rlctx.createImageData(N, N), step = (RAD_M * 2) / N;
+  for (let j = 0; j < N; j++) {
+    for (let i = 0; i < N; i++) {
+      const wx = cam.pos[0] + (i - N / 2 + 0.5) * step;
+      const wz = cam.pos[2] - (j - N / 2 + 0.5) * step;
+      const k = (j * N + i) * 4;
+      const p = precipAt(wx, wz);
+      if (p <= 0.03) { img.data[k + 3] = 0; continue; }
+      const c = dbzRGBA(10 + p * 54);
+      img.data[k] = c[0]; img.data[k + 1] = c[1]; img.data[k + 2] = c[2]; img.data[k + 3] = c[3];
+    }
+  }
+  rlctx.putImageData(img, 0, 0);
+
+  rctx.save();
+  rctx.beginPath(); rctx.arc(cx, cy, R, 0, 6.2832); rctx.clip();
+  rctx.drawImage(radLow, 0, 0, N, N, 0, 0, W, H);
+
+  rctx.strokeStyle = "rgba(150,180,215,0.20)"; rctx.lineWidth = 1;
+  for (let i = 1; i <= 4; i++) {
+    rctx.beginPath(); rctx.arc(cx, cy, R * i / 4, 0, 6.2832); rctx.stroke();
+  }
+  rctx.beginPath(); rctx.moveTo(cx, cy - R); rctx.lineTo(cx, cy + R);
+  rctx.moveTo(cx - R, cy); rctx.lineTo(cx + R, cy); rctx.stroke();
+
+  const toPx = (wx, wz) => [cx + (wx - cam.pos[0]) / RAD_M * R, cy - (wz - cam.pos[2]) / RAD_M * R];
+
+  // Storm marker and its motion vector.
+  if (A.super > 0.05) {
+    const sp = toPx(stormXZ[0], stormXZ[1]);
+    const m = stormMotionVec();
+    rctx.strokeStyle = "rgba(255,255,255,0.85)"; rctx.lineWidth = 1.2;
+    rctx.beginPath(); rctx.arc(sp[0], sp[1], 4.5, 0, 6.2832); rctx.stroke();
+    const mp = toPx(stormXZ[0] + m[0] * 900, stormXZ[1] + m[1] * 900);
+    rctx.beginPath(); rctx.moveTo(sp[0], sp[1]); rctx.lineTo(mp[0], mp[1]); rctx.stroke();
+    if (A.torn > 0.3) {
+      rctx.strokeStyle = "#ff4d4d"; rctx.lineWidth = 1.6;
+      rctx.beginPath(); rctx.arc(sp[0], sp[1], 8, 0, 6.2832); rctx.stroke();
+    }
+  }
+
+  // Own position, heading and field of view.
+  const fov = 0.50;
+  rctx.fillStyle = "rgba(92,201,220,0.16)";
+  rctx.beginPath(); rctx.moveTo(cx, cy);
+  rctx.arc(cx, cy, R * 0.55, -cam.yaw - Math.PI / 2 - fov, -cam.yaw - Math.PI / 2 + fov);
+  rctx.closePath(); rctx.fill();
+  rctx.fillStyle = "#5CC9DC";
+  rctx.beginPath(); rctx.arc(cx, cy, 2.6, 0, 6.2832); rctx.fill();
+  rctx.restore();
+
+  rctx.strokeStyle = "rgba(150,180,215,0.35)"; rctx.lineWidth = 1;
+  rctx.beginPath(); rctx.arc(cx, cy, R, 0, 6.2832); rctx.stroke();
+  rctx.fillStyle = "rgba(150,180,215,0.7)";
+  rctx.font = "9px monospace"; rctx.textAlign = "center";
+  rctx.fillText("N", cx, 10);
+}
+
 /* ══════════════════════════ interface ══════════════════════════ */
 const SLIDERS = [
   { g:"Thermodynamics", h:"--b", k:"dewDep",  l:"dew-point depression", min:1,  max:32,  st:0.5, f:v=>v.toFixed(1)+" K" },
@@ -1563,7 +1965,9 @@ const CHIPS = [
   { g:"Tier B · severe forces", h:"--b",
     items:[["super","Supercell"],["torn","Tornado"],["micro","Microburst"],["haboob","Haboob"],["ash","Ash plume"],["fuji","Fujiwhara"]] },
   { g:"Tier C · rare & upper air", h:"--c",
-    items:[["sprite","Red sprites"],["nlc","Noctilucent"],["ball","Ball lightning"],["cavum","Fallstreak hole"],["glory","Glory"],["pillar","Light pillars"]] }
+    items:[["sprite","Red sprites"],["nlc","Noctilucent"],["ball","Ball lightning"],["cavum","Fallstreak hole"],["glory","Glory"],["pillar","Light pillars"]] },
+  { g:"The chase", h:"--b",
+    items:[["ltg","Lightning"],["drift","Storm motion"],["chase","Chase lock (F)"],["scope","Radar (R)"],["sound","Sound"]] }
 ];
 
 const panel = document.getElementById("panel");
@@ -1609,6 +2013,9 @@ const sliderEls = {}, chipEls = {};
       b.addEventListener("click", () => {
         S[k] = S[k] > 0.5 ? 0 : 1;
         b.setAttribute("aria-pressed", S[k] > 0.5 ? "true" : "false");
+        if (k === "sound") { audioInit(); AU.on = S.sound > 0.5;
+                             if (AU.ctx && AU.ctx.state === "suspended") AU.ctx.resume(); }
+        if (k === "scope") document.getElementById("scope").classList.toggle("off", S.scope < 0.5);
         accum = 0;
       });
       chipEls[k] = b; row.appendChild(b);
@@ -1716,6 +2123,10 @@ addEventListener("keydown", e => {
   if (e.target && /INPUT|TEXTAREA/.test(e.target.tagName)) return;
   if (e.code === "Escape"){ toMenu(); return; }
   if (e.code === "Tab"){ e.preventDefault(); togglePanel(); return; }
+  if (e.code === "KeyF"){ S.chase = S.chase > 0.5 ? 0 : 1; syncUI(); return; }
+  if (e.code === "KeyR"){ S.scope = S.scope > 0.5 ? 0 : 1;
+                          document.getElementById("scope").classList.toggle("off", S.scope < 0.5);
+                          syncUI(); return; }
   if (e.code === "KeyH"){ uiHidden = !uiHidden; document.getElementById("ui").style.opacity = uiHidden ? "0" : "1";
                           document.getElementById("ui").style.pointerEvents = uiHidden ? "none" : "auto"; return; }
   if (KEYMAP[e.code]){ keys[KEYMAP[e.code]] = true; if (e.code === "Space") e.preventDefault(); }
@@ -1860,7 +2271,10 @@ function frame(now){
   const sc = QUALITY[S.quality].scale * dynScale;
   resizeTargets(Math.max(160, Math.round(cw * sc)), Math.max(90, Math.round(ch * sc)));
 
-  const busy = camMoved || easing || ev.flash > 0.02 || (A.ball > 0.02);
+  const rainAmt = inMenu ? 0 : rainAtCamera();
+  audioFrame(dt, rainAmt, camMoved ? Math.min(1, cam.speed / 900) : 0);
+  const busy = camMoved || easing || ev.flash > 0.02 || (A.ball > 0.02)
+             || (S.drift > 0.5 && A.super > 0.02) || bolts.length > 0;
   if (busy) accum = 0; else accum++;
   const fast = Math.max(A.torn, A.micro, A.haboob, A.ash, A.super * 0.5);
   const floor = frozen ? 0.03 : 0.06 + 0.22 * fast + Math.min(0.12, S.windSpd * 0.004);
@@ -1887,7 +2301,40 @@ function frame(now){
   gl.uniform1i(progPresent.u.uTex, 0);
   gl.uniform2f(progPresent.u.uRes, cv.width, cv.height);
   gl.uniform1f(progPresent.u.uSharp, sc < 0.95 ? QUALITY[S.quality].sharp : 0.0);
+  gl.uniform1f(progPresent.u.uTime, tSim);
+  gl.uniform1f(progPresent.u.uRain, rainAmt);
+  // Rain falls down the screen, slanted by however much the wind is crossing
+  // the view rather than blowing along it.
+  const cross = derived.wind[0] * b.r[0] + derived.wind[1] * b.r[2];
+  gl.uniform2f(progPresent.u.uRainDir, -cross * 0.05, -1.0);
   drawQuad();
+
+  // ── lightning channels: additive, over the composite, dimmed by cloud ──
+  if (bolts.length){
+    gl.useProgram(progBolt);
+    gl.bindVertexArray(boltVAOo);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, rts[cur]);
+    gl.uniform1i(progBolt.u.uCloud, 0);
+    gl.uniform2f(progBolt.u.uRes, cv.width, cv.height);
+    gl.uniform3f(progBolt.u.uCam, cam.pos[0], cam.pos[1], cam.pos[2]);
+    gl.uniformMatrix3fv(progBolt.u.uBasis, false,
+      [b.r[0], b.r[1], b.r[2], b.u[0], b.u[1], b.u[2], b.f[0], b.f[1], b.f[2]]);
+    gl.uniform1f(progBolt.u.uTanHalf, Math.tan(0.50));
+    gl.uniform1f(progBolt.u.uAspect, cv.width / Math.max(cv.height, 1));
+    gl.uniform1f(progBolt.u.uPxWorld, 2.0 * Math.tan(0.50) / Math.max(cv.height, 1));
+    for (let i = 0; i < bolts.length; i++){
+      const amp = boltAmp(bolts[i]);
+      if (amp <= 0.02) continue;
+      gl.bindBuffer(gl.ARRAY_BUFFER, boltVBOo);
+      gl.bufferData(gl.ARRAY_BUFFER, bolts[i].verts, gl.DYNAMIC_DRAW);
+      gl.uniform1f(progBolt.u.uAmp, amp);
+      gl.drawArrays(gl.TRIANGLES, 0, bolts[i].verts.length / 9);
+    }
+    gl.disable(gl.BLEND);
+    gl.bindVertexArray(vao);
+  }
 
   cur = 1 - cur;
 
@@ -1900,10 +2347,21 @@ function frame(now){
     document.getElementById("hBase").textContent = fmtM(derived.base);
     document.getElementById("hTop").textContent  = fmtM(A.super > 0.5 ? derived.EL : derived.top);
     document.getElementById("hW").textContent    = derived.wMax.toFixed(0) + " m/s";
-    document.getElementById("hSun").textContent  = S.sunElev.toFixed(0) + "°";
+    const dx = stormXZ[0] - cam.pos[0], dz = stormXZ[1] - cam.pos[2];
+    const rng = Math.hypot(dx, dz);
+    const brg = ((Math.atan2(dx, dz) * 180 / Math.PI) + 360) % 360;
+    const mv = stormMotionVec();
+    const mspd = Math.hypot(mv[0], mv[1]);
+    const mbrg = ((Math.atan2(mv[0], mv[1]) * 180 / Math.PI) + 360) % 360;
+    const active = A.super > 0.05 || A.ash > 0.05;
+    document.getElementById("hRange").textContent = active ? fmtM(rng) : "—";
+    document.getElementById("hBear").textContent  = active ? compass(brg) + " " + brg.toFixed(0) + "°" : "—";
+    document.getElementById("hMot").textContent   = active
+      ? (S.drift > 0.5 ? compass(mbrg) + " " + (mspd * 1.944).toFixed(0) + " kt" : "held") : "—";
     const f = document.getElementById("hFps");
     f.textContent = fpsShown; f.className = "v" + (fpsShown < 24 ? " warn" : "");
     if (q) q.textContent = rtW + " × " + rtH;
+    drawRadar();
   }
   requestAnimationFrame(frame);
 }

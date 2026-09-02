@@ -18,6 +18,8 @@ Open `index.html` in a browser with WebGL2 and hardware acceleration.
 | Fly | `W` `A` `S` `D` (or arrow keys), `Q` / `E` for up and down |
 | Faster | hold `Shift`; scroll wheel sets the base speed |
 | Scenarios | `Esc` returns to the menu |
+| Chase lock | `F` — the camera rides along with the storm's motion |
+| Radar | `R` toggles the reflectivity scope |
 | Interface | `Tab` toggles the control panel, `H` hides everything |
 
 Touch devices get an on-screen pad; drag still looks around.
@@ -33,6 +35,22 @@ Nine scenarios set up an environment; the phenomena then follow from it.
   from inside by their own lightning, Fujiwhara-style twin circulations.
 - **Tier C** — red sprites, noctilucent cloud, ball lightning, fallstreak holes,
   glories, light pillars.
+
+## Chasing
+
+Storms are steered by the flow they grow in — a supercell deviates about 30°
+right of the mean wind at three-quarters of its speed, so it can be followed,
+intercepted, or lost. The HUD carries range, bearing and storm motion; the
+scope in the corner is a reflectivity display sampled from the same
+precipitation field the renderer uses, so the hook and the rain-free notch you
+see on radar are the ones you can fly into.
+
+Lightning is geometry rather than a screen flash: a midpoint-displaced channel
+from the charge region to the ground, forked, lighting the cloud from inside
+and dimmed by whatever cloud sits in front of it. Thunder is synthesised and
+arrives late by the distance divided by the speed of sound, low-passed with
+range so a near strike cracks and a far one rolls. Rain falls on the lens when
+you are under the precipitation core, and you can hear it.
 
 ## How it renders
 
