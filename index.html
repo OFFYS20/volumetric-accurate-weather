@@ -354,6 +354,7 @@ const float PI = 3.14159265359;
 vec2  gWindDir;
 float gWindSpd;
 float gLoH, gHiH;
+float gVertLod;   // vertical spacing between samples, for pre-filtering flat layers
 
 /* ─────────────────────────── basics ─────────────────────────── */
 float hash11(float p){ return fract(sin(p * 78.233) * 43758.5453); }
@@ -406,6 +407,25 @@ bool bandRange(vec3 ro, vec3 rd, float h0, float h1, float TMAX, out float t0, o
 }
 
 /* ─────────────────────────── terrain ─────────────────────────── */
+/* Valley network. Water does not wander: it finds a line and cuts along it, so
+   a valley is a continuous trench with a flat floor and tributaries joining a
+   trunk — not a dip in some noise. The level set |n - 0.5| of a smooth field is
+   exactly such a set of continuous, branching lines; sharpening it into a
+   trench and taking the deepest of two scales gives a trunk valley with side
+   valleys feeding it. Domain-warping first makes them meander.
+   Cheap on purpose: the terrain trace evaluates this up to 160 times per ray. */
+float valleyCut(vec2 q, float mask){
+  vec2 w = q + vec2(vnoise2(q * 1.7 + 5.3), vnoise2(q * 1.7 + 9.1)) * 0.55;
+  float cut = 0.0;
+  for (int i = 0; i < 2; i++){
+    float fi = float(i);
+    float sc = 0.42 * (1.0 + 2.1 * fi);
+    float d  = abs(vnoise2(w * sc + fi * 6.1) - 0.5);
+    cut = max(cut, smoothstep(0.105 / (1.0 + fi * 0.8), 0.0, d) * (1.0 - fi * 0.26));
+  }
+  return cut * mask;
+}
+
 float terrainH(vec2 p){
   vec2 q = p * 0.000055;
   float mask = 0.22 + 0.78 * smoothstep(0.30, 0.80, fbm2c(q * 0.22 + 4.1));
@@ -416,7 +436,16 @@ float terrainH(vec2 p){
     a *= 0.48; f *= 2.17;
   }
   float base = fbm2c(q * 0.5) * 310.0 - 34.0 + fbm2c(q * 1.7) * 170.0;
-  return base + h * mask * uTerrain;
+  float H = base + h * mask * uTerrain;
+
+  // Cut the valleys in. The trench is cut relative to the LOCAL relief, so a
+  // valley stays a valley whether it runs through hills or mountains, and it
+  // bottoms out on a floor near the regional base level — a flat bottom at a
+  // common level across the map is what lets fog pond in it as one sheet.
+  float cut   = valleyCut(q, mask);
+  float carve = max(H - base, 0.0) * 0.88 + 90.0;
+  float flr   = base - 55.0 + 45.0 * vnoise2(q * 4.3);
+  return max(H - carve * cut, min(H, flr));
 }
 
 bool traceTerrain(vec3 ro, vec3 rd, out float tHit, out vec3 pHit){
@@ -634,7 +663,7 @@ float virgaForm(vec3 p, float h){
    blanket draped over the hills: it fills the terrain the way water fills a
    basin, and ridges stand out of it as islands. Getting that one fact right is
    the whole look of a valley at dusk. */
-float fogForm(vec3 p, float h){
+float fogForm(vec3 p, float h, float lod){
   if (uFogD <= 0.0) return 0.0;
   // Basins do not all pond to the same depth: some fill to the brim overnight,
   // some barely form. Varying the LEVEL rather than the density is what lets
@@ -650,8 +679,12 @@ float fogForm(vec3 p, float h){
   if (depth <= 0.0) return 0.0;
 
   // Densest at the bottom of the pool, feathering out over the last few tens of
-  // metres — that soft top edge is what lets hilltops float.
-  float feather = clamp(depth * 0.55, 14.0, 120.0);
+  // metres — that soft top edge is what lets hilltops float. At range the edge
+  // is widened to the march step: a hundred-metre slab sampled every hundred
+  // and fifty metres either lands in the fog or misses it, and the pattern that
+  // makes is rings on the ground. Pre-filtering the edge to the sample spacing
+  // turns that aliasing back into the soft gradient it should have been.
+  float feather = max(clamp(depth * 0.55, 14.0, 120.0), gVertLod * 1.20);
   float fill = smoothstep(lvl, lvl - feather, h);
   fill *= smoothstep(0.0, 65.0, depth);               // thin along the shoreline
   // Banks within a basin, and wisps drifting inside the banks.
@@ -821,7 +854,7 @@ vec4 sampleMedium(vec3 p, bool cheap, float lod, out float precipF){
   float lent = lentForm(p);
   water = max(water, lent);
   water = max(water, virgaForm(p, h));
-  float fogD = fogForm(p, h);
+  float fogD = fogForm(p, h, lod);
   water = max(water, fogD);
   water = max(water, altoForm(p, h));
 
@@ -1053,6 +1086,7 @@ float lightMarch(vec3 p, float lod){
   for (int i = 0; i < 6; i++){
     vec3 q = p + uSun * (t + dt * 0.5) + kCone[i] * dt * 0.9;
     float pf;
+    gVertLod = dt * max(abs(uSun.y), 0.06);
     d += sampleMedium(q, true, max(dt, lod), pf).x * dt;
     t += dt; dt *= 1.65;
   }
@@ -1088,6 +1122,15 @@ vec4 marchClouds(vec3 ro, vec3 rd, float tMax, float jitter, out float meanT){
   for (int i = 0; i < 320; i++){
     if (i >= uSteps || t > t1 || tr < 0.02) break;
     float dt = max(dtBase, t * 0.035);
+    // Near the top of a fog bank, step finely — the layer is thinner than one
+    // ordinary step. The floor grows with range, and the refinement stops
+    // altogether past 26 km, so a ray running along the top of the fog cannot
+    // spend its whole step budget before it reaches the horizon.
+    if (uFogD > 0.0 && t < 26000.0){
+      float dh = abs(hgt(ro + rd * t) - uFogLvl);
+      if (dh < 620.0) dt = min(dt, max(16.0, t * 0.004) + dh * 0.20);
+    }
+    gVertLod = dt * max(abs(rd.y), 0.06);
     vec3  p  = ro + rd * (t + dt * jitter);
     float pf;
     vec4  m  = sampleMedium(p, cheap, dt, pf);
@@ -1381,6 +1424,7 @@ vec3 aces(vec3 x){
 }
 
 void main(){
+  gVertLod = 40.0;
   gWindSpd = length(uWind);
   gWindDir = gWindSpd > 0.01 ? uWind / gWindSpd : vec2(1.0, 0.0);
   gLoH = 0.0;
@@ -1715,6 +1759,27 @@ const QUALITY = [
 ];
 
 function smoothstepJS(a, b, x) { const t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); }
+/* Where the fog ponds to. Cold air runs downhill and fills the low ground, so
+   the surface of a fog bank sits a fixed height above the VALLEY FLOORS, not
+   above sea level. Sampling a spiral of terrain around the viewer and taking a
+   low quantile of it finds those floors without needing a drainage model. */
+let fogQuant = null, fogQuantAt = [1e9, 1e9];
+function fogDatum(){
+  const cx = cam.pos[0], cz = cam.pos[2];
+  if (fogQuant === null || Math.hypot(cx - fogQuantAt[0], cz - fogQuantAt[1]) > 1400){
+    fogQuantAt = [cx, cz];
+    const v = [];
+    for (let i = 0; i < 96; i++){
+      const a = i * 2.39996, r = 400 + 270 * i;        // golden-angle spiral, out to ~26 km
+      v.push(terrainJS(cx + Math.cos(a) * r, cz + Math.sin(a) * r));
+    }
+    v.sort((p, q) => p - q);
+    const q = f => v[Math.floor((v.length - 1) * f)];
+    // The floor to pond from, and how much vertical the landscape has to give.
+    fogQuant = { lo: q(0.15), spread: Math.max(60, q(0.80) - q(0.05)) };
+  }
+  return fogQuant;
+}
 const derived = { precip: 0, fog: 0, fogLvl: 0, bow: 0 };
 function recompute() {
   derived.base = Math.max(140, Math.min(4600, 125 * S.dewDep));
@@ -1742,7 +1807,13 @@ function recompute() {
   derived.fog     = Math.min(1, Math.max(A.fog, derived.fogAuto));
   // Fog deepens through the night: a shallow pool covers the fields, a deep one
   // fills the valley to a couple of hundred metres and leaves only the ridges.
-  derived.fogLvl  = Math.max(S.sea + 25, 110 + 340 * derived.fog);
+  // The level is read off the terrain the viewer is actually over, because a
+  // fixed depth in metres cannot be right twice: 250 m of fog drowns a
+  // landscape with 300 m of relief and barely wets one with 1500 m.
+  const fd = fogDatum();
+  const lvlTarget = Math.max(S.sea + 25,
+                    fd.lo + Math.max(22.0, (0.10 + 0.30 * derived.fog) * fd.spread));
+  derived.fogLvl += (lvlTarget - derived.fogLvl) * 0.03;   // never slides visibly
 
   // A cloud rains when it is deep enough for drops to grow by collision, and
   // when there is enough of it. Fair-weather cumulus 900 m thick do not; a
@@ -1858,7 +1929,23 @@ function terrainJS(px, pz){
     h += a * (1 - Math.abs(n * 2 - 1));
     a *= 0.48; f *= 2.17;
   }
-  return jfbmc(qx * 0.5, qz * 0.5) * 310 - 34 + jfbmc(qx * 1.7, qz * 1.7) * 170 + h * smask * S.terrain;
+  const base = jfbmc(qx * 0.5, qz * 0.5) * 310 - 34 + jfbmc(qx * 1.7, qz * 1.7) * 170;
+  const H = base + h * smask * S.terrain;
+  // mirror of valleyCut()
+  const wx = qx + jvnoise(qx * 1.7 + 5.3, qz * 1.7 + 5.3) * 0.55;
+  const wz = qz + jvnoise(qx * 1.7 + 9.1, qz * 1.7 + 9.1) * 0.55;
+  let cut = 0;
+  for (let i = 0; i < 2; i++){
+    const sc = 0.42 * (1 + 2.1 * i);
+    const d = Math.abs(jvnoise(wx * sc + i * 6.1, wz * sc + i * 6.1) - 0.5);
+    const w = 0.105 / (1 + i * 0.8);
+    const t = Math.max(0, Math.min(1, (w - d) / w));
+    cut = Math.max(cut, t * t * (3 - 2 * t) * (1 - i * 0.26));
+  }
+  cut *= smask;
+  const carve = Math.max(H - base, 0) * 0.88 + 90;
+  const flr = base - 55 + 45 * jvnoise(qx * 4.3, qz * 4.3);
+  return Math.max(H - carve * cut, Math.min(H, flr));
 }
 function groundClearance(x, z){ return terrainJS(x, z) + 22; }
 
@@ -2412,6 +2499,11 @@ function applyScenario(sc){
   lookAt(sc.look);
   cam.speed = 260;
   currentScn = sc;
+  fogQuant = null;
+  derived.fog = Math.min(1, S.fog);
+  { const fd = fogDatum();
+    derived.fogLvl = Math.max(S.sea + 25,
+                     fd.lo + Math.max(22.0, (0.10 + 0.30 * derived.fog) * fd.spread)); }
   recompute(); syncUI(); accum = 0;
 }
 function launch(sc){
