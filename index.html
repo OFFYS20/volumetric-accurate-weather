@@ -345,7 +345,7 @@ uniform float uFlash;
 uniform vec3  uFlashP;
 uniform vec4  uBall;
 uniform float uTerrain, uGround, uSnow, uSea;
-uniform vec4  uTurret[9];   // xy = offset from axis, z = centre height, w = radius
+uniform vec4  uTurret[14];  // xy = offset from axis, z = centre height, w = radius
 
 const float R  = 6371000.0;
 const float PI = 3.14159265359;
@@ -483,107 +483,105 @@ float layerForm(vec3 p, float h, float hf){
   return cov * heightGradient(clamp(hf, 0.0, 1.0), st, tall);
 }
 
-/* The anvil is not a slab. It is a lens of glaciated ice spreading at the
-   equilibrium level: thick at the centre, tapering to a sharp rim, domed on top
-   and comparatively flat beneath, and — because it has already frozen and is
-   spreading laminarly — far smoother than the boiling tower that feeds it.
-   `ice` reports how much of this sample is that canopy, so the erosion stage can
-   leave it alone; `anvTop` is the local top of the canopy, for occlusion. */
+/* Smooth union for coverage fields. A hard max() leaves a crease wherever two
+   primitives meet — that crease is precisely what makes a storm read as a
+   cylinder with slabs parked on it, and no amount of tuning the primitives can
+   remove a corner the combining operator is creating. This fillets the joins. */
+float smax(float a, float b, float k){
+  float t = clamp(0.5 + 0.5 * (a - b) / k, 0.0, 1.0);
+  return mix(b, a, t) + k * t * (1.0 - t);
+}
+
+/* The storm is ONE body, not an assembly. A single radius-versus-height profile
+   runs from cloud base to the overshooting top: it widens as the updraft rises,
+   opens out where the parcel loses buoyancy — that opening IS the anvil, not a
+   disc laid on top — and closes over into the dome. Turrets deform that one
+   skin from inside rather than being spheres glued to a pipe. */
 float stormForm(vec3 p, float h, out float ice, out float anvTop){
   ice = 0.0; anvTop = 0.0;
   if (uSuper <= 0.0) return 0.0;
-  vec2 ax = uStorm + gWindDir * max(h - uBase, 0.0) * 0.001 * uShear * 70.0;
-  vec2 d2 = p.xz - ax;
-  float r = length(d2);
+
+  vec2  ax = uStorm + gWindDir * max(h - uBase, 0.0) * 0.001 * uShear * 70.0;
+  vec2  d2 = p.xz - ax;
+  float r  = length(d2);
 
   float colTop = uEL;
   float core   = 4200.0;
+  float f = (h - uBase) / max(colTop - uBase, 1.0);   // 0 at base, 1 at the EL
 
-  // Updraft tower. An updraft is not one smooth cone: it is a cluster of
-  // bubbles, each rising to its own height and collapsing back, which is what
-  // gives a real tower its stepped, knobbly, one-sided profile. The trunk only
-  // binds them together.
-  float colProf = smoothstep(uBase - 40.0, uBase + 460.0, h) * smoothstep(colTop + 900.0, colTop - 3000.0, h);
-  float colR    = core * (0.48 + 0.54 * smoothstep(uBase, colTop, h));
-  float trunk   = smoothstep(colR, colR * 0.62, r) * colProf;
+  // ── the tower half of the profile ──────────────────────────────────────
+  float rTower = core * (0.38 + 0.44 * smoothstep(0.0, 1.05, f));
 
-  // Each bubble is a rounded blob, not a cylinder with a lid — flat tops union
-  // into a slab, which is exactly what a boiling tower is not.
-  float cluster = 0.0;
-  for (int i = 0; i < 9; i++){
+  // Turrets displace the tower's own radius outward — a knob raised on the
+  // skin, which cannot leave a seam, instead of a sphere unioned onto a pipe,
+  // which always does.
+  vec2  rdir = d2 / max(r, 1.0);
+  float angW = smoothstep(0.0, core * 0.55, r);   // azimuth is meaningless on axis
+  float lobes = 0.0;
+  for (int i = 0; i < 14; i++){
     vec4 T = uTurret[i];
     if (T.w < 1.0) continue;
-    vec3 q = vec3(d2.x - T.x, (h - T.z) * 0.78, d2.y - T.y);
-    cluster = max(cluster, smoothstep(T.w, T.w * 0.72, length(q)));
+    vec2  tdir = normalize(T.xy + vec2(1e-5));
+    float ad   = 1.0 - dot(tdir, rdir);                 // 0 same side, 2 opposite
+    float lobe = mix(1.0, exp(-ad * ad * 2.2), angW);
+    float dz   = (h - T.z) / (T.w * 1.55);
+    lobes += (T.w / core) * exp(-dz * dz) * lobe;
   }
-  cluster *= smoothstep(uBase - 40.0, uBase + 420.0, h);
-  float col = max(trunk, cluster);
+  rTower *= 1.0 + lobes * 0.42;
 
-  // The canopy. An elliptical cross-section gives the sharp thin rim that a
-  // linear taper never does, and it is what the eye reads as "anvil".
-  vec2  ad = d2 - gWindDir * 5200.0;
-  // Outflow spreads further downwind than up, so the canopy is an ellipse, and
-  // its rim is scalloped rather than turned on a lathe.
-  vec2  wa = vec2(dot(ad, gWindDir) / 1.35, dot(ad, vec2(-gWindDir.y, gWindDir.x)));
-  float ang  = atan(wa.y, wa.x);
-  // Outflow is dragged out downwind: the canopy carries a long fibrous tail on
-  // the lee side rather than closing into an ellipse.
-  float dw   = dot(normalize(ad + vec2(1e-4)), gWindDir);
-  float tail = 1.0 + 0.95 * smoothstep(0.10, 1.0, dw);
-  float anvR = core * 3.5 * tail
-             * (0.78 + 0.44 * fbm2c(vec2(cos(ang), sin(ang)) * 1.8 + 7.3)
-                     + 0.18 * fbm2c(vec2(cos(ang), sin(ang)) * 6.5 + 2.1));
-  float u    = length(wa) / anvR;
-  float lens = pow(max(1.0 - u * u, 0.0), 0.42);
-  float mid  = colTop + 400.0;
-  float thick = 6200.0 * lens;
-  float aT    = mid + thick * 0.64;
-  float aB    = mid - thick * 0.36;
-  float anvil = smoothstep(aT, aT - 520.0, h) * smoothstep(aB, aB + 460.0, h);
-  // Faint radial striations, the way the outflow actually spreads.
-  anvil *= 0.94 + 0.06 * sin(u * 30.0 + ang * 3.0);
-  // The outer canopy frays into radial streamers instead of ending at a wall.
-  float fib = 0.42 + 0.85 * fbm2c(vec2(ang * 3.2, u * 4.5) + 13.0);
-  anvil *= mix(1.0, fib, smoothstep(0.48, 1.0, u));
+  // ── the canopy half of the same profile ────────────────────────────────
+  vec2  ad2 = d2 - gWindDir * 5200.0;
+  vec2  wa  = vec2(dot(ad2, gWindDir) / 1.35, dot(ad2, vec2(-gWindDir.y, gWindDir.x)));
+  float ang = atan(wa.y, wa.x);
+  float dw  = dot(normalize(ad2 + vec2(1e-4)), gWindDir);
+  float tail = 1.0 + 0.95 * smoothstep(0.10, 1.0, dw);   // dragged out downwind
+  float rim  = 0.78 + 0.44 * fbm2c(vec2(cos(ang), sin(ang)) * 1.8 + 7.3)
+                    + 0.18 * fbm2c(vec2(cos(ang), sin(ang)) * 6.5 + 2.1);
+  float anvR = core * 3.5 * tail * rim;
 
-  // Overshooting top: the one rough thing on the canopy, punched through the
-  // ice by an updraft that outran its own buoyancy. Sits upwind of centre.
-  vec2  axTop = uStorm + gWindDir * max(mid - uBase, 0.0) * 0.001 * uShear * 70.0;
-  vec2  oc  = axTop - gWindDir * 2200.0;
-  float ro  = length(p.xz - oc);
-  float ovR = core * 1.20;
-  float ov  = smoothstep(ovR, ovR * 0.30, ro)
-            * smoothstep(aT + 3000.0, aT - 1100.0, h) * step(aB, h) * 0.95;
+  // A smooth bump centred just above the equilibrium level. Where it is 1 the
+  // body is anvil-wide, where it is 0 the body is tower-wide, and in between it
+  // is the flare that joins them. One function, so no join to see.
+  float cf     = (f - 1.02) / 0.21;
+  float canopy = exp(-cf * cf * 1.5);
+  float rBody  = mix(rTower, max(anvR, rTower), canopy);
 
-  // Lowered, rotating cloud base under the mesocyclone.
+  // Overshooting top: the dome's ceiling lifted locally, upwind of centre.
+  vec2  oc   = -gWindDir * 2200.0;
+  float ro   = length(d2 - oc) / (core * 0.95);
+  float lift = exp(-ro * ro) * 3400.0;
+  float topH = colTop + 2500.0 + lift;
+
+  float vProf = smoothstep(uBase - 60.0, uBase + 430.0, h)
+              * smoothstep(topH + 2400.0, topH - 200.0, h);
+  float edge  = mix(0.58, 0.88, canopy);   // the canopy ends at a rim, the tower does not
+  float body  = smoothstep(rBody, rBody * edge, r) * vProf;
+
+  // Turbulence belongs to the convective parts, not the frozen canopy.
+  float turb = 0.66 + 0.66 * fbm2c(d2 * 0.00034 + vec2(h * 0.00022, uTime * 0.006));
+  body *= mix(turb, 0.96 + 0.08 * turb, canopy);
+
+  // ── the base, blended in rather than stacked on ────────────────────────
   float lower = uBase - min(380.0, uBase * 0.42);
-  float wall = smoothstep(2200.0, 700.0, r) * smoothstep(lower, lower + 320.0, h)
-             * smoothstep(uBase + 2200.0, uBase + 400.0, h) * 0.8;
+  float wall  = smoothstep(2400.0, 800.0, r) * smoothstep(lower, lower + 320.0, h)
+              * smoothstep(uBase + 2400.0, uBase + 400.0, h) * 0.85 * turb;
 
-  // Precipitation shelf: the rain-filled underbelly and flanking line spread
-  // far wider than the updraft that feeds them, which is what makes a supercell
-  // bottom-heavy rather than a mushroom on a stalk.
-  vec2  sd = d2 - gWindDir * 2600.0;          // precipitation falls downwind
+  vec2  sd = d2 - gWindDir * 2600.0;                   // precipitation falls downwind
   float sr = length(vec2(dot(sd, gWindDir) / 1.25, dot(sd, vec2(-gWindDir.y, gWindDir.x))));
-  float shelfR = core * 2.4 * (0.85 + 0.30 * fbm2c(sd * 0.00009 + 4.7));
-  // The rain-free base: the updraft is drawing air up, so nothing falls through
-  // it. This notch is the reason a tornado is ever visible from the ground.
-  float rainFree = smoothstep(1700.0, 4300.0, r);
+  float shelfR   = core * 2.4 * (0.85 + 0.30 * fbm2c(sd * 0.00009 + 4.7));
+  float rainFree = smoothstep(1700.0, 4300.0, r);      // the notch under the updraft
   float shelf = smoothstep(shelfR, shelfR * 0.55, sr) * rainFree
               * smoothstep(uBase - 120.0, uBase + 520.0, h)
-              * smoothstep(uBase + 4200.0, uBase + 900.0, h) * 0.82;
+              * smoothstep(uBase + 4200.0, uBase + 900.0, h) * 0.82 * turb;
 
-  // Turbulence belongs to the convective parts, not to the frozen canopy.
-  float turb = 0.66 + 0.66 * fbm2c(d2 * 0.00034 + vec2(h * 0.00022, uTime * 0.006));
-  col   *= turb;
-  wall  *= turb;
-  shelf *= turb;
-  ov   *= 0.80 + 0.35 * turb;
-  anvil *= 0.96 + 0.08 * turb;
+  // Everything joins with a fillet. k is a blend radius in coverage units.
+  float total = smax(body, smax(wall, shelf, 0.30), 0.34);
 
-  float total = max(max(col, anvil), max(max(ov, wall), shelf));
-  if (total > 1e-4) ice = clamp((anvil - max(max(ov, col), shelf) * 1.2) / total, 0.0, 1.0);
-  anvTop = aT;
+  // Glaciated fraction, taken from where we are in the profile rather than by
+  // comparing separate pieces: the canopy is ice, the overshoot punching
+  // through it is not.
+  ice    = clamp(canopy * smoothstep(0.55, 0.88, f) * (1.0 - exp(-ro * ro * 0.8)), 0.0, 1.0);
+  anvTop = colTop + 2500.0;
   return clamp(total * uSuper * 0.94, 0.0, 1.0);
 }
 
@@ -744,8 +742,16 @@ vec4 sampleMedium(vec3 p, bool cheap, float lod){
   float d = remap(sn.r, 1.0 - form, 1.0, 0.0, 1.0);
   if (d <= 0.0) return vec4(0.0);
 
-  float midW  = 1.0 - smoothstep(340.0, 1500.0, lod);
-  float fineW = 1.0 - smoothstep(70.0, 300.0, lod);
+  // Three erosion tiers at three physically different scales. The coarse
+  // shape lookup above (~5 km period) sets the silhouette; below that, a real
+  // tower's visible texture is dominated by ~300-1500 m lobes ("cauliflower")
+  // — that band was missing entirely before, which is why turrets rendered as
+  // bald spheres: the old "medium" pass reused the same ~5 km-period texture
+  // as the coarse shape (too coarse to vary across one bubble), and the fine
+  // 476 m pass is gated off by LOD at any distance you would actually view a
+  // storm from — its step size exceeds that by a few kilometres out.
+  float cauliW = 1.0 - smoothstep(2600.0, 11000.0, lod);
+  float fineW  = 1.0 - smoothstep(70.0, 300.0, lod);
   float keep = 1.0 - form * 0.22;          // dense cores keep their mass
   // Lens clouds and the glaciated anvil both form in laminar flow. Eroding them
   // with turbulence noise is exactly wrong — it is why they look smooth and cut
@@ -754,25 +760,32 @@ vec4 sampleMedium(vec3 p, bool cheap, float lod){
   float laminar = max(clamp(lent / max(form, 1e-4), 0.0, 1.0), iceFrac);
   keep *= 1.0 - laminar * 0.72;
   if (!cheap){
-    // Medium erosion, taken from the shape volume's own Worley octaves rather
-    // than a third texture: cauliflower up top, filaments down at the base.
-    float mid = sn.b * 0.62 + sn.a * 0.38;
-    mid = mix(mid, 1.0 - mid, clamp(hf * 2.4, 0.0, 1.0));
-    d = remap(d, mid * 0.34 * keep * midW, 1.0, 0.0, 1.0);
-    if (d <= 0.0) return vec4(0.0);
+    if (cauliW > 0.01){
+      // Cauliflower lobes: the same 3D texture resampled at a scale close to a
+      // single turret's radius, so bubbles read as clusters of rounded knobs
+      // instead of one smooth balloon. Domain-warped so lobes look pushed
+      // apart by their neighbours rather than painted onto the surface.
+      vec3 cp = wp * 0.00095;
+      cp.xz += vec2(sin(wp.z * 0.0007 + uTime * 0.05), cos(wp.x * 0.0006 - uTime * 0.04)) * 0.6;
+      cp -= vec3(uWind.x, 0.0, uWind.y) * (uTime * 0.0011);
+      vec4 cn = texture(uShape, cp);
+      float cauli = cn.g * 0.55 + cn.b * 0.45;
+      cauli = mix(cauli, 1.0 - cauli, clamp(hf * 2.0, 0.0, 1.0));
+      d = remap(d, cauli * 0.46 * keep * cauliW, 1.0, 0.0, 1.0);
+      if (d <= 0.0) return vec4(0.0);
+    }
 
-    if (fineW <= 0.01) { d = clamp(d, 0.0, 1.0) * uDensity; }
-    else {
-    // Fine erosion, swirled so edges churn instead of sliding downwind rigidly
-    // with the body of the cloud.
-    vec3 dp = wp * 0.0021;
-    dp.xz += vec2(sin(wp.y * 0.0013 + uTime * 0.12),
-                  cos(wp.x * 0.0009 - uTime * 0.10)) * 0.55;
-    dp -= vec3(uWind.x, 0.0, uWind.y) * (uTime * 0.0027);
-    vec3 dn = texture(uDetail, dp).rgb;
-    float det = dn.r * 0.625 + dn.g * 0.25 + dn.b * 0.125;
-    det = mix(det, 1.0 - det, clamp(hf * 2.2, 0.0, 1.0));
-    d = remap(d, det * 0.30 * keep * fineW, 1.0, 0.0, 1.0);
+    if (fineW > 0.01){
+      // Fine erosion, swirled so edges churn instead of sliding downwind rigidly
+      // with the body of the cloud. Only resolves at close range.
+      vec3 dp = wp * 0.0021;
+      dp.xz += vec2(sin(wp.y * 0.0013 + uTime * 0.12),
+                    cos(wp.x * 0.0009 - uTime * 0.10)) * 0.55;
+      dp -= vec3(uWind.x, 0.0, uWind.y) * (uTime * 0.0027);
+      vec3 dn = texture(uDetail, dp).rgb;
+      float det = dn.r * 0.625 + dn.g * 0.25 + dn.b * 0.125;
+      det = mix(det, 1.0 - det, clamp(hf * 2.2, 0.0, 1.0));
+      d = remap(d, det * 0.30 * keep * fineW, 1.0, 0.0, 1.0);
     }
   }
   d = clamp(d, 0.0, 1.0) * uDensity;
@@ -785,7 +798,7 @@ vec4 sampleMedium(vec3 p, bool cheap, float lod){
   if (iceFrac > 0.3){
     // Inside the canopy, occlusion is depth below its own top. This is what
     // turns the underside of an anvil near-black while its top stays brilliant.
-    ao = exp(-max(anvTop - h, 0.0) * 0.00055);
+    ao = exp(-max(anvTop - h, 0.0) * 0.00034);
   } else {
     float mTop = (hf > 1.0 && uSuper > 0.0) ? uEL : uTop;
     float span = max(mTop - uBase, 200.0);
@@ -1707,19 +1720,21 @@ function boltAmp(bl) {
 /* Each bubble rises, tops out and collapses on its own clock, so the tower is
    never symmetric and never the same shape twice. */
 const TURRETS = [];
-for (let i = 0; i < 9; i++)
+for (let i = 0; i < 14; i++)
   TURRETS.push({ ph: Math.random(), sp: 0.010 + Math.random() * 0.020,
                  ang: Math.random() * 6.283,
                  // bubbles stack up the tower, spreading wider the higher they sit
-                 hFrac: 0.10 + (i / 9) * 0.86 + Math.random() * 0.08,
+                 hFrac: 0.05 + (i / 14) * 0.92 + Math.random() * 0.06,
                  // offsets have to exceed the bubble radii or the cluster
-                 // just averages back into an axisymmetric column
-                 spread: 0.55 + Math.random() * 0.85,
-                 rad: 0.40 + Math.random() * 0.26 });
-const turretBuf = new Float32Array(36);
+                 // averages back into an axisymmetric column, but they still
+                 // need to overlap their neighbours to read as one packed
+                 // mass rather than a scatter of separate balls
+                 spread: 0.40 + Math.random() * 0.62,
+                 rad: 0.56 + Math.random() * 0.30 });
+const turretBuf = new Float32Array(56);
 function updateTurrets(t) {
   const core = 4200, span = derived.EL - derived.base;
-  for (let i = 0; i < 9; i++) {
+  for (let i = 0; i < 14; i++) {
     const T = TURRETS[i];
     const cyc = (t * T.sp + T.ph) % 1;
     const amp = Math.sin(cyc * Math.PI);          // born, peaks, dies back
@@ -1851,9 +1866,9 @@ const SCENARIOS = [
   { id:"super", hue:"var(--b)", name:"Supercell", tag:"Tier B · rotating storm", g:G.super,
     desc:"3200 J/kg of CAPE under 25 m/s of shear, from 30 km out. Broad glaciated canopy, rough overshooting top, wide rain-filled base.",
     set:{ dewDep:8, cape:3200, coverage:0.30, stratus:0, cirrus:0, windSpd:15, windDir:200, shear:7,
-          sunElev:26, sunAz:250, haze:0.33, terrain:300, ground:0.35, snow:6000, sea:-400,
+          sunElev:17, sunAz:150, haze:0.33, terrain:300, ground:0.35, snow:6000, sea:-400,
           virga:1,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:1,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
-    storm:[4000,6000], cam:[-20000,2400,-23000], look:[4000,8600,6000] },
+    storm:[4000,6000], cam:[-21000,9200,-24000], look:[4000,11600,6000] },
 
   { id:"torn", hue:"var(--b)", name:"Tornado", tag:"Tier B · condensation funnel", g:G.torn,
     desc:"A low condensation level lets the funnel reach the ground. Raise the dew-point depression and it lifts.",
