@@ -337,7 +337,8 @@ uniform int   uSteps;
 uniform vec3  uSun;
 uniform float uBase, uTop, uEL, uCoverage, uDensity, uStratus, uCirrus;
 uniform vec2  uWind;
-uniform float uShear, uHaze, uExposure, uVirga, uFogD, uFogTop;
+uniform float uShear, uHaze, uExposure, uVirga, uFogD, uFogTop, uFogLvl;
+uniform float uPrecip, uAltoc, uBow;
 uniform vec2  uStorm;
 uniform float uSuper, uTorn, uMicro, uHaboob, uAsh, uFuji, uFront;
 uniform float uHalo, uGlory, uPillar, uNLC, uSprite, uCavum, uLent, uNacre;
@@ -542,7 +543,17 @@ float stormForm(vec3 p, float h, out float ice, out float anvTop){
   // A smooth bump centred just above the equilibrium level. Where it is 1 the
   // body is anvil-wide, where it is 0 the body is tower-wide, and in between it
   // is the flare that joins them. One function, so no join to see.
-  float cf     = (f - 1.02) / 0.21;
+  float cf = (f - 1.02) / 0.21;
+  // Mammatus. Under an anvil, ice-laden air is heavier than the clear air below
+  // it and sinks back down in discrete pockets, giving that underside its rows
+  // of hanging pouches. Deforming the LOWER half of the canopy's own profile
+  // grows them out of the surface that is already there, so they cannot detach
+  // from it the way glued-on spheres would. cf = 0 divides to 0 either way, so
+  // the switch at the canopy's waist introduces no crease.
+  vec2  mp  = p.xz - uStorm;
+  float mam = fbm2c(mp * 0.00082 + 3.7) * 0.62 + fbm2c(mp * 0.0021 - 1.4) * 0.38;
+  mam = smoothstep(0.40, 0.90, mam);
+  cf /= 1.0 + 0.46 * mam * step(cf, 0.0) * smoothstep(core * 0.85, core * 1.9, r);
   float canopy = exp(-cf * cf * 1.5);
   float rBody  = mix(rTower, max(anvR, rTower), canopy);
 
@@ -617,13 +628,124 @@ float virgaForm(vec3 p, float h){
   return smoothstep(0.52, 0.86, m) * (1.0 - f) * (1.0 - f) * uVirga * 0.7;
 }
 
+/* Radiation fog. After sunset the ground radiates its heat to space, the air
+   in contact with it cools to its dew point, and the cold air — being denser —
+   runs downhill and ponds. So the top of a fog bank is a LEVEL surface, not a
+   blanket draped over the hills: it fills the terrain the way water fills a
+   basin, and ridges stand out of it as islands. Getting that one fact right is
+   the whole look of a valley at dusk. */
 float fogForm(vec3 p, float h){
-  if (uFogD <= 0.0 || h > uFogTop * 1.5) return 0.0;
-  float ftop   = uFogTop * (0.74 + 0.48 * fbm2c(p.xz * 0.000045 + 11.3));
-  if (h > ftop) return 0.0;
-  float drain  = 1.0 - smoothstep(uFogTop * 0.85, uFogTop * 1.5, terrainH(p.xz));
-  float patchy = 0.60 + 0.55 * fbm2c(p.xz * 0.000085 + vec2(uTime * 0.004, 0.0));
-  return clamp(smoothstep(ftop, ftop * 0.55, h) * drain * patchy * uFogD, 0.0, 1.0);
+  if (uFogD <= 0.0) return 0.0;
+  // Basins do not all pond to the same depth: some fill to the brim overnight,
+  // some barely form. Varying the LEVEL rather than the density is what lets
+  // ground emerge between the banks instead of the whole valley going white.
+  float basin = smoothstep(0.20, 0.74, fbm2c(p.xz * 0.000024 + 4.7));
+  float lvl = uFogLvl - (1.0 - basin) * 280.0
+            + 68.0 * fbm2c(p.xz * 0.000042 + vec2(uTime * 0.0028, 0.0))
+            + 14.0 * fbm2c(p.xz * 0.00036  - vec2(0.0, uTime * 0.011));
+  if (h > lvl) return 0.0;
+  float g = terrainH(p.xz);
+  if (h < g - 30.0) return 0.0;
+  float depth = lvl - g;
+  if (depth <= 0.0) return 0.0;
+
+  // Densest at the bottom of the pool, feathering out over the last few tens of
+  // metres — that soft top edge is what lets hilltops float.
+  float feather = clamp(depth * 0.55, 14.0, 120.0);
+  float fill = smoothstep(lvl, lvl - feather, h);
+  fill *= smoothstep(0.0, 65.0, depth);               // thin along the shoreline
+  // Banks within a basin, and wisps drifting inside the banks.
+  float bank = smoothstep(0.24, 0.70, fbm2c(p.xz * 0.000082 + 11.3));
+  float wisp = 0.60 + 0.62 * fbm2c(p.xz * 0.00031 + vec2(uTime * 0.006, uTime * 0.003));
+  return clamp(fill * mix(0.46, 1.0, bank) * wisp * uFogD * 1.3, 0.0, 1.0);
+}
+
+/* Altocumulus: a mid-level deck of separated cells. Rolls form across the
+   shear vector, so the lookup is squashed along the wind and the field
+   organises into billow rows instead of scattering isotropically. */
+float altoForm(vec3 p, float h){
+  if (uAltoc <= 0.0) return 0.0;
+  float b = 4300.0, t = 5250.0;
+  float f = (h - b) / (t - b);
+  if (f <= 0.0 || f >= 1.0) return 0.0;
+  vec2  q = p.xz - uWind * uTime * 1.55;
+  vec2  e = vec2(dot(q, gWindDir) * 0.30, dot(q, vec2(-gWindDir.y, gWindDir.x)));
+  float cell = fbm2c(e * 0.00092) * 0.60 + fbm2c(e * 0.0029) * 0.40;
+  float sheet = smoothstep(0.26, 0.68, fbm2c(q * 0.000038 + 5.1));
+  float m = smoothstep(0.46 - 0.15 * uAltoc, 0.74, cell) * mix(0.30, 1.0, sheet);
+  return clamp(m * sin(f * PI) * uAltoc * 1.15, 0.0, 1.0);
+}
+
+/* Rain rate in a column, 0..1. precipAt() on the CPU mirrors this, so the radar
+   scope, the audio bed and the lens rain all agree with what is being drawn
+   rather than inventing a second, disagreeing field. */
+float rainRate(vec2 xz, float lean){
+  float rate = 0.0;
+  if (uPrecip > 0.0){
+    vec2  q = xz - uWind * uTime - gWindDir * lean;
+    float w = fbm2c(q * 0.00011) * 0.72 + fbm2c(q * 0.000031) * 0.28;
+    float cov = clamp(uCoverage * 1.62 - 0.20 + (w - 0.5) * 1.30, 0.0, 1.0);
+    // Only the deep, well-formed parts of a deck rain, and they rain in cells.
+    float cell = fbm2c(q * 0.00040 + vec2(uTime * 0.006, 0.0));
+    rate = smoothstep(0.58, 0.94, cov) * smoothstep(0.36, 0.76, cell) * uPrecip;
+  }
+  if (uSuper > 0.0){
+    // Forward-flank core, displaced downwind of the updraft and hollow right at
+    // the mesocyclone — that hole is the rain-free base a chaser parks under.
+    vec2  d  = xz - uStorm - gWindDir * lean * 0.6;
+    vec2  sd = d - gWindDir * 2600.0;
+    float along  = dot(sd, gWindDir);
+    float across = dot(sd, vec2(-gWindDir.y, gWindDir.x));
+    // Precipitation falls DOWNWIND of the updraft. Squeezing the upwind half of
+    // the core hard is what leaves the inflow notch open — the rain-free wedge
+    // on the storm's upwind flank that a chaser parks in to watch the base.
+    float sr = length(vec2((along < 0.0 ? along * 2.8 : along) / 1.25, across));
+    rate = max(rate, smoothstep(10080.0, 5544.0, sr)
+                   * smoothstep(1700.0, 4300.0, length(d)) * uSuper);
+  }
+  return clamp(rate, 0.0, 1.0);
+}
+
+/* The rain itself: curtains hanging out of the cloud base. Drops fall at only
+   ~8 m/s, so in any real wind the curtain leans hard downwind and its foot
+   trails several hundred metres behind the cloud that is making it. That lean
+   is most of what makes rain read as falling rather than as a grey wall. */
+float shaftForm(vec3 p, float h, out float rainf){
+  rainf = 0.0;
+  if (uPrecip <= 0.0 && uSuper <= 0.0) return 0.0;
+  if (h > uBase + 260.0) return 0.0;
+  float g = terrainH(p.xz);
+  if (h < g - 20.0) return 0.0;
+
+  float drop = max(uBase - h, 0.0);
+  // Terminal velocity for a raindrop is about 9 m/s, so the horizontal drift on
+  // the way down is (wind / 9) times the distance fallen. In a 20 m/s wind the
+  // curtain lies over at more than 60 degrees, and that lean is most of what
+  // makes rain read as falling rather than as a grey wall.
+  float lean = drop * clamp(gWindSpd / 9.0, 0.12, 1.3);
+  float rate = rainRate(p.xz, lean);
+  if (rate <= 0.012) return 0.0;
+
+  float fall = clamp(drop / max(uBase - g, 400.0), 0.0, 1.0);
+  // Curtains within the cell. The lookup runs across the wind and barely varies
+  // with height, so the structure is vertical streaks rather than blobs — and
+  // it stays coarse enough vertically to survive a march step of tens of metres.
+  vec2  lat = vec2(dot(p.xz - gWindDir * lean, vec2(-gWindDir.y, gWindDir.x)),
+                   dot(p.xz - gWindDir * lean, gWindDir));
+  float streak = 0.34 + 0.82 * smoothstep(0.28, 0.72,
+                   fbm2(vec2(lat.x * 0.0020 + h * 0.00003, lat.y * 0.0011 - uTime * 0.09)));
+  streak *= 0.62 + 0.62 * fbm2(vec2(lat.x * 0.0092, lat.y * 0.0034 + h * 0.00018 - uTime * 0.55));
+  // Light rain evaporates on the way down and never lands; heavy rain gets
+  // there. The same field therefore produces virga and a downpour.
+  float reach = mix(1.0 - smoothstep(0.28, 0.95, fall), 1.0, smoothstep(0.22, 0.72, rate));
+  // Rain rate maps to optical depth steeply: it takes very little rain before a
+  // curtain is already hard to see through.
+  // The top of the curtain stays below the base so the cloud covers the join;
+  // rain does not start in clear air above the thing producing it.
+  float body = smoothstep(0.02, 0.40, rate) * streak * reach
+             * smoothstep(uBase + 60.0, uBase - 420.0, h);
+  rainf = clamp(body, 0.0, 1.0);
+  return rainf * 0.88;
 }
 
 float lentForm(vec3 p){
@@ -684,7 +806,8 @@ float microForm(vec3 p, float h, out float dustRing){
 }
 
 /* Returns: x = density, y = dust fraction, z = ash fraction, w = sky occlusion. */
-vec4 sampleMedium(vec3 p, bool cheap, float lod){
+vec4 sampleMedium(vec3 p, bool cheap, float lod, out float precipF){
+  precipF = 0.0;
   float h  = hgt(p);
   if (h < gLoH - 50.0 || h > gHiH + 50.0) return vec4(0.0);
   float hf = (h - uBase) / max(uTop - uBase, 1.0);
@@ -698,7 +821,26 @@ vec4 sampleMedium(vec3 p, bool cheap, float lod){
   float lent = lentForm(p);
   water = max(water, lent);
   water = max(water, virgaForm(p, h));
-  water = max(water, fogForm(p, h));
+  float fogD = fogForm(p, h);
+  water = max(water, fogD);
+  water = max(water, altoForm(p, h));
+
+  // Rain below the base, and the scud it drags along with it.
+  float rainAmt = 0.0;
+  float shaft = shaftForm(p, h, rainAmt);
+  if (shaft > 0.0){
+    // Scud: ragged fractus torn off the base and lifted in the rain-cooled
+    // outflow. Always found under a raining cloud, and it is what sells the
+    // gap between the base and the ground as full of air, not empty space.
+    float sb = uBase - 460.0;
+    float sz = (h - sb) / 230.0;
+    float sn = fbm2c((p.xz - uWind * uTime * 1.2) * 0.00046 + vec2(0.0, uTime * 0.02));
+    float scud = smoothstep(0.60, 0.88, sn) * smoothstep(0.06, 0.34, rainAmt)
+               * exp(-sz * sz) * 0.62;
+    water = max(water, scud);
+    water = max(water, shaft);
+  }
+  float notRain = water > shaft ? water : 0.0;
   if (uCirrus > 0.0){                       // thin ice veil well above the deck
     float cf = (h - 8600.0) / 2200.0;
     if (cf > 0.0 && cf < 1.0){
@@ -726,6 +868,8 @@ vec4 sampleMedium(vec3 p, bool cheap, float lod){
 
   float form = max(max(water, dust), ash);
   if (form <= 0.02) return vec4(0.0);
+  if (shaft > 0.004)
+    precipF = clamp(shaft / max(shaft + max(max(notRain, dust), ash), 1e-4) * 1.5, 0.0, 1.0);
 
   // Shape volume, advected with the wind so detail travels with the air.
   vec3 wp = p;
@@ -739,7 +883,11 @@ vec4 sampleMedium(vec3 p, bool cheap, float lod){
   }
   vec3 sp = (wp - vec3(uWind.x, 0.0, uWind.y) * uTime) * 0.00019;
   vec4 sn = texture(uShape, sp);
+  float fogFrac = clamp(fogD / max(form, 1e-4), 0.0, 1.0);
   float d = remap(sn.r, 1.0 - form, 1.0, 0.0, 1.0);
+  // Neither a rain curtain nor a fog bank is a carved cumulus edge. Running
+  // them through the shape volume stipples one and shreds the other.
+  d = mix(d, form, clamp(precipF * 0.78 + fogFrac * 0.42, 0.0, 1.0));
   if (d <= 0.0) return vec4(0.0);
 
   // Three erosion tiers at three physically different scales. The coarse
@@ -759,6 +907,8 @@ vec4 sampleMedium(vec3 p, bool cheap, float lod){
   float iceFrac = ice * clamp(storm / max(form, 1e-4), 0.0, 1.0);
   float laminar = max(clamp(lent / max(form, 1e-4), 0.0, 1.0), iceFrac);
   keep *= 1.0 - laminar * 0.72;
+  // Neither rain nor fog boils the way a convective cloud does.
+  keep *= 1.0 - clamp(precipF * 0.85 + fogFrac * 0.80, 0.0, 1.0);
   if (!cheap){
     if (cauliW > 0.01){
       // Cauliflower lobes: the same 3D texture resampled at a scale close to a
@@ -805,6 +955,8 @@ vec4 sampleMedium(vec3 p, bool cheap, float lod){
     if (h > uBase - 20.0)
       ao = exp(-form * clamp((mTop - h) / span, 0.0, 1.0) * span * 0.0016);
   }
+  // Rain hangs under the deck that made it, so it never sees the sky.
+  ao = mix(ao, 0.10, precipF);
 
   float tot = max(water + dust + ash, 1e-4);
   return vec4(d, dust / tot, ash / tot, ao);
@@ -900,7 +1052,8 @@ float lightMarch(vec3 p, float lod){
   float d = 0.0, t = 0.0, dt = 70.0;
   for (int i = 0; i < 6; i++){
     vec3 q = p + uSun * (t + dt * 0.5) + kCone[i] * dt * 0.9;
-    d += sampleMedium(q, true, max(dt, lod)).x * dt;
+    float pf;
+    d += sampleMedium(q, true, max(dt, lod), pf).x * dt;
     t += dt; dt *= 1.65;
   }
   return d;
@@ -936,7 +1089,8 @@ vec4 marchClouds(vec3 ro, vec3 rd, float tMax, float jitter, out float meanT){
     if (i >= uSteps || t > t1 || tr < 0.02) break;
     float dt = max(dtBase, t * 0.035);
     vec3  p  = ro + rd * (t + dt * jitter);
-    vec4  m  = sampleMedium(p, cheap, dt);
+    float pf;
+    vec4  m  = sampleMedium(p, cheap, dt, pf);
 
     if (cheap){
       if (m.x > 0.0){ cheap = false; t -= dt * 2.6; continue; }
@@ -951,6 +1105,12 @@ vec4 marchClouds(vec3 ro, vec3 rd, float tMax, float jitter, out float meanT){
 
     vec3  alb   = mix(mix(vec3(1.0), vec3(0.96, 0.68, 0.40), m.y), vec3(0.44, 0.41, 0.38), m.z);
     float sigma = mix(mix(0.012, 0.030, m.y), 0.055, m.z);
+    // Raindrops are a thousand times larger and ten thousand times sparser than
+    // cloud droplets: far less extinction per metre, and almost no multiple
+    // scattering to brighten them. That is why a shaft reads as a translucent
+    // blue-grey veil you can see terrain through, not as more cloud.
+    alb   = mix(alb, vec3(0.36, 0.41, 0.51), pf);
+    sigma = mix(sigma, 0.0090, pf);
     float sunD  = lightMarch(p, dt);
     float hf    = clamp((hgt(p) - uBase) / max(uTop - uBase, 1.0), 0.0, 1.0);
 
@@ -968,6 +1128,7 @@ vec4 marchClouds(vec3 ro, vec3 rd, float tMax, float jitter, out float meanT){
       lum += sunC * beer * phase * bn;
     }
     lum *= mix(1.0, powder, 0.85);
+    lum *= mix(1.0, 0.15, pf);
     lum *= mix(1.0, 0.72, m.z);                       // ash barely multiple-scatters
 
     if (uFlash > 0.0){                                 // discharge lights the cloud from inside
@@ -1117,6 +1278,49 @@ vec3 angularOptics(vec3 rd, float cloudTr, float skyMask){
   return c * cloudTr * skyMask;
 }
 
+/* A rainbow needs three things at once: the sun low and behind you, rain in
+   front of you, and enough light reaching it. Spherical drops focus light into
+   a caustic at a minimum deviation of 42° from the antisolar point, dispersed
+   over ~1.8° with red on the outside. Light that bounces twice inside the drop
+   emerges at 51° with the order reversed, and between the two bows almost no
+   light comes back at all — Alexander's dark band. All three come out of the
+   same geometry, so all three are here. */
+vec3 spectrum(float x){                     // 0 = violet, 1 = red
+  return clamp(vec3(smoothstep(0.40, 0.88, x),
+                    smoothstep(0.08, 0.46, x) * smoothstep(1.04, 0.60, x),
+                    smoothstep(0.50, 0.04, x)), 0.0, 1.0);
+}
+vec3 rainbow(vec3 ro, vec3 rd, float tEnd){
+  if (uBow <= 0.0 || uSun.y < 0.004) return vec3(0.0);
+  float th = acos(clamp(dot(rd, -uSun), -1.0, 1.0));
+  if (th < 0.63 || th > 0.99) return vec3(0.0);
+
+  // The bow lives on whatever curtain is actually out there, so look for rain
+  // along this ray instead of painting it on the sky. Near samples matter most:
+  // the drops that send light back to you are the ones close enough for it to
+  // survive the trip.
+  float wet = 0.0;
+  for (int i = 0; i < 3; i++){
+    float t = min(tEnd, 900.0 + float(i) * 2600.0);
+    wet = max(wet, rainRate((ro + rd * t).xz, 400.0 + float(i) * 300.0) * (1.0 - float(i) * 0.22));
+  }
+  if (wet <= 0.02) return vec3(0.0);
+
+  // Primary: violet at 40.6°, red at 42.4°.
+  float x1 = (th - 0.7086) / 0.0314;
+  float e1 = x1 * 2.0 - 1.0;
+  vec3 pri = (spectrum(clamp(x1, 0.0, 1.0)) * 0.86 + 0.17) * exp(-e1 * e1 * 1.6)
+           * step(-0.25, x1) * step(x1, 1.25);
+  // Secondary: fainter, wider, reversed.
+  float x2 = (0.9320 - th) / 0.0524;
+  float e2 = x2 * 2.0 - 1.0;
+  vec3 sec = (spectrum(clamp(x2, 0.0, 1.0)) * 0.86 + 0.14) * exp(-e2 * e2 * 1.9)
+           * step(-0.25, x2) * step(x2, 1.25) * 0.20;
+
+  float lit = smoothstep(0.0, 0.22, uSun.y) * (0.45 + 0.55 * smoothstep(0.35, 0.02, uSun.y));
+  return (pri + sec) * wet * lit * uBow * 0.38;
+}
+
 /* ─────────────────────────── upper atmosphere ─────────────────────────── */
 vec3 sprites(vec3 ro, vec3 rd){
   if (uSprite <= 0.0) return vec3(0.0);
@@ -1180,10 +1384,13 @@ void main(){
   gWindSpd = length(uWind);
   gWindDir = gWindSpd > 0.01 ? uWind / gWindSpd : vec2(1.0, 0.0);
   gLoH = 0.0;
-  if (uVirga <= 0.0 && uTorn <= 0.0 && uHaboob <= 0.0 && uMicro <= 0.0 && uAsh <= 0.0 && uLent <= 0.0 && uFogD <= 0.0)
+  if (uVirga <= 0.0 && uTorn <= 0.0 && uHaboob <= 0.0 && uMicro <= 0.0 && uAsh <= 0.0 &&
+      uLent <= 0.0 && uFogD <= 0.0 && uPrecip <= 0.0 && uSuper <= 0.0)
     gLoH = max(0.0, uBase - 300.0);
-  gHiH = max(uTop, uEL + 5400.0);
-  if (uFogD > 0.0) gHiH = max(gHiH, uFogTop * 1.6);
+  gHiH = uTop;
+  if (uSuper > 0.0) gHiH = max(gHiH, uEL + 5400.0);
+  if (uFogD  > 0.0) gHiH = max(gHiH, uFogLvl + 90.0);
+  if (uAltoc > 0.0) gHiH = max(gHiH, 5350.0);
   if (uAsh   > 0.0) gHiH = max(gHiH, 16500.0);
   if (uCirrus > 0.0) gHiH = max(gHiH, uTop);
 
@@ -1218,6 +1425,7 @@ void main(){
   col = col * trA + ins;
 
   col += angularOptics(rd, cl.a, hitG ? 0.0 : 1.0);
+  col += rainbow(ro, rd, hitG ? tG : 40000.0);
   col += vec3(0.75, 0.82, 1.0) * uFlash * 0.045;
 
   col = aces(col * uExposure);
@@ -1323,7 +1531,7 @@ void main(){
     float s = rainLayer(rp, 34.0, 2.6, 0.90 - uRain * 0.14, uTime) * 0.9
             + rainLayer(rp, 21.0, 1.7, 0.92 - uRain * 0.12, uTime * 0.83 + 3.1) * 0.7
             + rainLayer(rp, 13.0, 1.1, 0.94 - uRain * 0.10, uTime * 0.61 + 7.7) * 0.5;
-    c += vec3(0.62, 0.70, 0.82) * s * uRain;
+    c += vec3(0.62, 0.70, 0.82) * s * uRain * 0.62;
     c = mix(c, vec3(0.34, 0.38, 0.44), uRain * 0.13);      // the air itself greys out
   }
 
@@ -1487,7 +1695,7 @@ const S = {
   windSpd: 7, windDir: 215, shear: 3.0,
   sunElev: 38, sunAz: 130, haze: 0.55, exposure: 1.0,
   terrain: 850, ground: 0.15, snow: 2400, sea: 0,
-  virga: 0, fog: 0, halo: 0, glory: 0, pillar: 0, lent: 0, cavum: 0,
+  virga: 0, fog: 0, altoc: 0, bow: 1, halo: 0, glory: 0, pillar: 0, lent: 0, cavum: 0,
   super: 0, torn: 0, micro: 0, haboob: 0, ash: 0, fuji: 0,
   sprite: 0, nlc: 0, ball: 0,
   drift: 1, chase: 0, ltg: 1, sound: 0, scope: 1,
@@ -1495,7 +1703,7 @@ const S = {
 };
 // Phenomena ease in and out instead of popping, which also gives the
 // accumulation buffer something to converge toward.
-const EASED = ["virga","fog","halo","glory","pillar","lent","cavum","super","torn",
+const EASED = ["virga","fog","altoc","bow","halo","glory","pillar","lent","cavum","super","torn",
                "micro","haboob","ash","fuji","sprite","nlc","ball","stratus","cirrus"];
 const A = {}; EASED.forEach(k => A[k] = S[k]);
 
@@ -1506,7 +1714,8 @@ const QUALITY = [
   { name: "Ultra",steps: 200, scale: 1.00, sharp: 0.2 }
 ];
 
-const derived = {};
+function smoothstepJS(a, b, x) { const t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); }
+const derived = { precip: 0, fog: 0, fogLvl: 0, bow: 0 };
 function recompute() {
   derived.base = Math.max(140, Math.min(4600, 125 * S.dewDep));
   const depth = (240 + S.cape * 0.78) * (1 - 0.55 * A.stratus);
@@ -1518,6 +1727,36 @@ function recompute() {
   derived.sun = [Math.cos(el) * Math.sin(az), Math.sin(el), Math.cos(el) * Math.cos(az)];
   const wd = (S.windDir + 180) * Math.PI / 180;
   derived.wind = [Math.sin(wd) * S.windSpd, Math.cos(wd) * S.windSpd];
+
+  // Radiation fog is not a switch, it is a coincidence of three conditions:
+  // the ground has to be radiating (sun near or below the horizon), the air has
+  // to be close to saturation, and the wind has to be light enough that
+  // turbulence does not mix the cold surface layer away. Miss any one and you
+  // get a clear night instead. The chip stays as a manual override on top.
+  // Fog starts forming as the sun goes down and survives until it is a good
+  // ten degrees up and burning the pool off from the top.
+  const dusk  = smoothstepJS(11, 0, S.sunElev);
+  const moist = smoothstepJS(9, 2.5, S.dewDep);
+  const calm  = smoothstepJS(7.5, 1.5, S.windSpd);
+  derived.fogAuto = dusk * moist * calm;
+  derived.fog     = Math.min(1, Math.max(A.fog, derived.fogAuto));
+  // Fog deepens through the night: a shallow pool covers the fields, a deep one
+  // fills the valley to a couple of hundred metres and leaves only the ridges.
+  derived.fogLvl  = Math.max(S.sea + 25, 110 + 340 * derived.fog);
+
+  // A cloud rains when it is deep enough for drops to grow by collision, and
+  // when there is enough of it. Fair-weather cumulus 900 m thick do not; a
+  // congestus 3 km thick does. Supercell precipitation is handled separately,
+  // in the shader, because it has structure.
+  const cloudDepth = derived.top - derived.base;
+  derived.precip = smoothstepJS(0.50, 0.84, S.coverage)
+                 * smoothstepJS(800, 2400, cloudDepth)
+                 * (1 - 0.55 * A.stratus) * (1 - 0.6 * A.fog);
+
+  // A bow needs the sun behind you and below 42°, and rain in front. Everything
+  // else is done in the shader, which knows where the rain actually is.
+  derived.bow = A.bow * smoothstepJS(0, 6, S.sunElev) * smoothstepJS(42, 30, S.sunElev)
+              * Math.min(1, derived.precip * 2.2 + A.super * 0.9);
 }
 
 /* ══════════════════════════ camera ══════════════════════════ */
@@ -1763,19 +2002,34 @@ function stormMotionVec() {
 }
 
 /* ══════════════════════════ precipitation ══════════════════════════ */
-function smoothstepJS(a, b, x) { const t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); }
-/* Mirror of the shelf in the shader, so the radar scope and the rain agree with
-   what is actually being rendered instead of inventing a second field. */
+/* Mirror of rainRate() in the shader, so the radar scope, the audio bed and the
+   lens agree with what is actually being drawn instead of inventing a second,
+   disagreeing field. Both halves are here: the organised supercell core, and
+   the cellular rain any deep deck produces. */
 function precipAt(x, z) {
-  if (A.super <= 0.03) return 0;
-  const core = 4200, gw = windUnit();
-  const dx = x - stormXZ[0], dz = z - stormXZ[1];
-  const r = Math.hypot(dx, dz);
-  const sx = dx - gw[0] * 2600, sz = dz - gw[1] * 2600;
-  const along = (sx * gw[0] + sz * gw[1]) / 1.25;
-  const across = sx * -gw[1] + sz * gw[0];
-  const sr = Math.hypot(along, across);
-  return smoothstepJS(core * 2.4, core * 2.4 * 0.55, sr) * smoothstepJS(1700, 4300, r) * A.super;
+  let rate = 0;
+  const t = tSim;
+  if (derived.precip > 0.01) {
+    const qx = x - derived.wind[0] * t, qz = z - derived.wind[1] * t;
+    const w = jfbmc(qx * 0.00011, qz * 0.00011) * 0.72
+            + jfbmc(qx * 0.000031, qz * 0.000031) * 0.28;
+    const cov = Math.max(0, Math.min(1, S.coverage * 1.62 - 0.20 + (w - 0.5) * 1.30));
+    const cell = jfbmc(qx * 0.00040 + t * 0.006, qz * 0.00040);
+    rate = smoothstepJS(0.58, 0.94, cov) * smoothstepJS(0.36, 0.76, cell) * derived.precip;
+  }
+  if (A.super > 0.03) {
+    const core = 4200, gw = windUnit();
+    const dx = x - stormXZ[0], dz = z - stormXZ[1];
+    const r = Math.hypot(dx, dz);
+    const sx = dx - gw[0] * 2600, sz = dz - gw[1] * 2600;
+    let along = sx * gw[0] + sz * gw[1];
+    const across = sx * -gw[1] + sz * gw[0];
+    if (along < 0) along *= 2.8;                  // the inflow notch stays open
+    const sr = Math.hypot(along / 1.25, across);
+    rate = Math.max(rate, smoothstepJS(core * 2.4, core * 2.4 * 0.55, sr)
+                        * smoothstepJS(1700, 4300, r) * A.super);
+  }
+  return rate;
 }
 function rainAtCamera() {
   return precipAt(cam.pos[0], cam.pos[2])
@@ -1852,6 +2106,7 @@ const G = {
   fog:     '<svg viewBox="0 0 160 46"><path d="M8 30q26-14 44-2q22-16 40 0q20-12 40 2z" fill="#4A5A72" opacity=".7"/><g stroke="#B6C4D6" opacity=".75"><path d="M18 34h36M62 34h44M114 34h30M28 39h48M84 39h50"/></g><circle cx="126" cy="12" r="6" fill="#F0913E"/><g stroke="#F0913E" opacity=".4"><path d="M126 12L96 30M126 12L112 32M126 12L140 32"/></g></svg>',
   ice:     '<svg viewBox="0 0 160 46"><circle cx="80" cy="23" r="5" fill="#EAF2FF"/><circle cx="80" cy="23" r="17" fill="none" stroke="#9FD8E4" stroke-width="1.4"/><circle cx="63" cy="23" r="3.5" fill="#F0913E"/><circle cx="97" cy="23" r="3.5" fill="#F0913E"/><path d="M80 4v-4M80 42v4" stroke="#EAF2FF" stroke-width="3"/><path d="M8 42h144" stroke="#4A5A72"/></svg>',
   tle:     '<svg viewBox="0 0 160 46"><g stroke="#A98BF7" stroke-width="1.3" fill="none"><path d="M72 4v10M72 14l-8 10M72 14l8 10M64 24l-4 9M80 24l4 9M72 14l-1 14"/></g><circle cx="72" cy="4" r="2" fill="#A98BF7"/><path d="M8 34q28-8 52-2q26-7 48-1q24-5 44 3" stroke="#5CC9DC" stroke-width="1.3" fill="none" opacity=".8"/><g fill="#E7EDF7" opacity=".55"><circle cx="24" cy="10" r="1"/><circle cx="130" cy="14" r="1"/><circle cx="40" cy="20" r="1"/></g></svg>',
+  rain:    '<svg viewBox="0 0 160 46"><path d="M14 24q4-13 17-11q5-11 19-7q12-6 18 7q12 0 10 11z" fill="#5A6E8A"/><path d="M78 24q4-11 15-9q4-9 16-6q10-5 15 6q10 0 8 9z" fill="#4A5A72"/><g stroke="#5CC9DC" stroke-width="1.3" opacity=".8"><path d="M24 30l-4 10M38 30l-4 10M52 30l-4 10M66 30l-4 10M88 30l-4 10M102 30l-4 10M116 30l-4 10"/></g><path d="M8 43h144" stroke="#4A5A72"/></svg>',
   lee:     '<svg viewBox="0 0 160 46"><path d="M8 42l34-26 22 16 26-22 30 32z" fill="#3B475C"/><ellipse cx="86" cy="14" rx="26" ry="5" fill="#C3D2E4"/><ellipse cx="94" cy="24" rx="18" ry="3.5" fill="#A9BACE" opacity=".85"/><path d="M8 42h144" stroke="#4A5A72"/></svg>'
 };
 
@@ -1860,63 +2115,77 @@ const SCENARIOS = [
     desc:"A shallow convective field on a summer afternoon. Move the dew point and watch every base move together.",
     set:{ dewDep:11, cape:520, coverage:0.44, stratus:0, cirrus:0, windSpd:6, windDir:215, shear:2,
           sunElev:44, sunAz:130, haze:0.5, terrain:800, ground:0.15, snow:2600, sea:-15,
-          virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+          altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
     storm:[6000,9000], cam:[0,2950,-9000], look:[0,1650,4000] },
 
   { id:"super", hue:"var(--b)", name:"Supercell", tag:"Tier B · rotating storm", g:G.super,
     desc:"3200 J/kg of CAPE under 25 m/s of shear, from 30 km out. Broad glaciated canopy, rough overshooting top, wide rain-filled base.",
     set:{ dewDep:8, cape:3200, coverage:0.30, stratus:0, cirrus:0, windSpd:15, windDir:200, shear:7,
           sunElev:17, sunAz:150, haze:0.33, terrain:300, ground:0.35, snow:6000, sea:-400,
-          virga:1,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:1,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+          altoc:0,bow:1,virga:1,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:1,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
     storm:[4000,6000], cam:[-21000,9200,-24000], look:[4000,11600,6000] },
 
   { id:"torn", hue:"var(--b)", name:"Tornado", tag:"Tier B · condensation funnel", g:G.torn,
     desc:"A low condensation level lets the funnel reach the ground. Raise the dew-point depression and it lifts.",
     set:{ dewDep:6, cape:3600, coverage:0.22, stratus:0, cirrus:0, windSpd:14, windDir:200, shear:8,
           sunElev:17, sunAz:255, haze:0.5, terrain:140, ground:0.4, snow:6000, sea:-400,
-          virga:1,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:1,torn:1,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+          altoc:0,bow:1,virga:1,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:1,torn:1,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
     storm:[1200,2200], cam:[-600,330,-2900], look:[1200,900,2200] },
 
   { id:"haboob", hue:"var(--b)", name:"Haboob", tag:"Tier B · density current", g:G.haboob,
     desc:"A gravity current running out ahead of a dying storm, lofting a wall of dust with a rolling head.",
     set:{ dewDep:24, cape:900, coverage:0.14, stratus:0, cirrus:0, windSpd:17, windDir:180, shear:2,
           sunElev:11, sunAz:250, haze:0.6, terrain:180, ground:0.95, snow:9000, sea:-400,
-          virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:1,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+          altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:1,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
     storm:[0,14000], front:-1400, cam:[0,340,3000], look:[0,1900,-9000] },
 
   { id:"ash", hue:"var(--b)", name:"Ash Column", tag:"Tier B · plume + discharge", g:G.ash,
     desc:"A buoyant plume spreading into an umbrella at its neutral buoyancy level, lit from inside by its own lightning.",
     set:{ dewDep:14, cape:400, coverage:0.18, stratus:0, cirrus:0, windSpd:9, windDir:210, shear:3,
           sunElev:23, sunAz:265, haze:0.55, terrain:520, ground:0.35, snow:2400, sea:-400,
-          virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:1,fuji:0,sprite:0,nlc:0,ball:0 },
+          altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:1,fuji:0,sprite:0,nlc:0,ball:0 },
     storm:[0,0], cam:[-9000,1500,-9000], look:[0,6500,0] },
 
   { id:"fog", hue:"var(--a)", name:"Sea of Fog", tag:"Tier A · radiation fog", g:G.fog,
     desc:"Cold air draining into the valleys overnight, with the sun just clearing the ridge. Look away from it for the glory.",
     set:{ dewDep:14, cape:150, coverage:0.22, stratus:0.6, cirrus:0, windSpd:2, windDir:90, shear:1,
           sunElev:5, sunAz:95, haze:0.45, terrain:1200, ground:0.1, snow:2800, sea:-400,
-          virga:0,fog:1,halo:0,glory:1,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+          altoc:0,bow:1,virga:0,fog:1,halo:0,glory:1,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
     storm:[6000,9000], cam:[-2400,1450,-1200], look:[4000,300,3500] },
 
   { id:"ice", hue:"var(--a)", name:"Ice Optics", tag:"Tier A/C · halo, dogs, pillars", g:G.ice,
     desc:"A cirrostratus veil of hexagonal prisms. The 22° ring, its parhelia and a pillar from the oriented plates.",
     set:{ dewDep:16, cape:80, coverage:0.30, stratus:0.85, cirrus:1, windSpd:11, windDir:250, shear:2,
           sunElev:7, sunAz:0, haze:0.4, terrain:380, ground:0.0, snow:500, sea:-400,
-          virga:0,fog:0,halo:1,glory:0,pillar:1,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+          altoc:0,bow:1,virga:0,fog:0,halo:1,glory:0,pillar:1,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
     storm:[6000,9000], cam:[0,950,-4000], look:[0,1500,4000] },
 
   { id:"tle", hue:"var(--c)", name:"Night Sky", tag:"Tier C · sprites, NLC", g:G.tle,
     desc:"Deep twilight. A distant mesoscale system throwing sprites into the mesosphere, with noctilucent cloud above it.",
     set:{ dewDep:9, cape:2600, coverage:0.30, stratus:0, cirrus:0, windSpd:10, windDir:200, shear:5,
           sunElev:-9, sunAz:320, haze:0.3, terrain:600, ground:0.2, snow:2600, sea:-400,
-          virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:1,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:1,nlc:1,ball:0 },
+          altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:1,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:1,nlc:1,ball:0 },
     storm:[30000,26000], cam:[-6000,2000,-10000], look:[30000,33000,26000] },
+
+  { id:"rain", hue:"var(--a)", name:"Rainband", tag:"Tier A · shafts & the bow", g:G.rain,
+    desc:"A deep, well-covered deck letting go. Curtains lean downwind as they fall, scud hangs under the base, and with the sun low behind you the 42° bow stands on the rain.",
+    set:{ dewDep:17, cape:2600, coverage:0.72, stratus:0.12, cirrus:0, windSpd:11, windDir:272, shear:4,
+          sunElev:14, sunAz:272, haze:0.22, terrain:620, ground:0.22, snow:3600, sea:-400,
+          altoc:1,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+    storm:[6000,9000], cam:[-15000,1780,1400], look:[9000,420,-600] },
+
+  { id:"dusk", hue:"var(--a)", name:"Valley Dusk", tag:"Tier A · fog forming", g:G.fog,
+    desc:"Nothing is switched on here. The ground is radiating, the dew-point depression is 3 K and the wind has dropped below 2 m/s — so fog forms, and ponds level in the valleys while the ridges stay clear. Raise the wind and watch it mix away.",
+    set:{ dewDep:3, cape:120, coverage:0.16, stratus:0.15, cirrus:0.35, windSpd:1.4, windDir:140, shear:1,
+          sunElev:4.0, sunAz:285, haze:0.30, exposure:1.5, terrain:1050, ground:0.08, snow:3000, sea:-400,
+          altoc:0,bow:0,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+    storm:[6000,9000], cam:[-10600,700,-1200], look:[2000,170,600] },
 
   { id:"lee", hue:"var(--a)", name:"Lee Wave", tag:"Tier A · lenticular stack", g:G.lee,
     desc:"A standing gravity wave over the ridge. The air moves through at 22 m/s; the cloud does not move at all.",
     set:{ dewDep:13, cape:200, coverage:0.16, stratus:0.2, cirrus:0, windSpd:22, windDir:250, shear:4,
           sunElev:21, sunAz:225, haze:0.45, terrain:1300, ground:0.1, snow:2200, sea:-400,
-          virga:0,fog:0,halo:0,glory:0,pillar:0,lent:1,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+          altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:1,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
     storm:[6000,9000], cam:[3000,2900,-21000], look:[-11000,4200,-9000] }
 ];
 
@@ -2030,7 +2299,8 @@ const SLIDERS = [
 ];
 const CHIPS = [
   { g:"Tier A · baseline & optics", h:"--a",
-    items:[["virga","Virga"],["fog","Radiation fog"],["cirrus","Cirrus veil"],["halo","22° halo"],["lent","Lenticular"]] },
+    items:[["virga","Virga"],["fog","Radiation fog"],["altoc","Altocumulus"],["cirrus","Cirrus veil"],
+           ["bow","Rainbow"],["halo","22° halo"],["lent","Lenticular"]] },
   { g:"Tier B · severe forces", h:"--b",
     items:[["super","Supercell"],["torn","Tornado"],["micro","Microburst"],["haboob","Haboob"],["ash","Ash plume"],["fuji","Fujiwhara"]] },
   { g:"Tier C · rare & upper air", h:"--c",
@@ -2284,8 +2554,12 @@ function setUniforms(b){
   gl.uniform1f(u.uHaze, S.haze);
   gl.uniform1f(u.uExposure, S.exposure);
   gl.uniform1f(u.uVirga, A.virga);
-  gl.uniform1f(u.uFogD, A.fog * 0.95);
-  gl.uniform1f(u.uFogTop, 240 + 520 * A.fog);
+  gl.uniform1f(u.uFogD, derived.fog * 0.95);
+  gl.uniform1f(u.uFogTop, 240 + 520 * derived.fog);
+  gl.uniform1f(u.uFogLvl, derived.fogLvl);
+  gl.uniform1f(u.uPrecip, derived.precip);
+  gl.uniform1f(u.uAltoc, A.altoc);
+  gl.uniform1f(u.uBow, derived.bow);
   gl.uniform2f(u.uStorm, stormXZ[0], stormXZ[1]);
   gl.uniform1f(u.uSuper, A.super);
   gl.uniform1f(u.uTorn, A.torn);

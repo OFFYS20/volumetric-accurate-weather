@@ -26,15 +26,38 @@ Touch devices get an on-screen pad; drag still looks around.
 
 ## What it simulates
 
-Nine scenarios set up an environment; the phenomena then follow from it.
+Eleven scenarios set up an environment; the phenomena then follow from it.
 
-- **Tier A** — cumuliform and stratiform decks, virga, radiation fog, crepuscular rays,
-  22° halo with parhelia, lenticular stacks, cirrus veil.
-- **Tier B** — supercells with sheared anvils and overshooting tops, tornadic funnels
+- **Tier A** — cumuliform and stratiform decks, altocumulus billow rows, rain shafts
+  and the scud under them, virga, radiation fog, crepuscular rays, the 42° rainbow with
+  its secondary and Alexander's dark band, 22° halo with parhelia, lenticular stacks,
+  cirrus veil.
+- **Tier B** — supercells with sheared anvils, mammatus on the anvil underside,
+  overshooting tops, a forward-flank precipitation core with the inflow notch open
+  beside it, tornadic funnels
   with debris, microburst outflows, haboob density currents, volcanic ash plumes lit
   from inside by their own lightning, Fujiwhara-style twin circulations.
 - **Tier C** — red sprites, noctilucent cloud, ball lightning, fallstreak holes,
   glories, light pillars.
+
+## Rain and fog
+
+Rain is a volume, not a texture: shafts hang out of the base of any deck deep enough
+for drops to grow by collision, lean downwind by the wind speed over the drop's ~9 m/s
+terminal velocity, and either reach the ground or evaporate into virga on the way,
+depending on how hard it is falling. They scatter far less per metre than cloud does
+and sit in the cloud's own shadow, which is what makes a curtain a translucent
+blue-grey veil rather than more cloud. Under a supercell the core is one-sided —
+downwind of the updraft — so the rain-free wedge a chaser parks in stays open.
+
+Radiation fog is not a switch. It forms where three conditions coincide: the ground is
+radiating (sun near or below the horizon), the air is near saturation (small dew-point
+depression), and the wind is light enough not to mix the cold surface layer away. Raise
+the wind above about 7 m/s and it disappears. Because cold air is dense and runs
+downhill, the top of a fog bank is a *level* surface rather than a blanket following the
+ground — it fills the terrain the way water fills a basin, and ridges stand out of it as
+islands. Different basins pond to different depths. The **Valley Dusk** scenario switches
+nothing on at all; it just sets an environment in which fog has to form.
 
 ## Chasing
 
@@ -50,7 +73,8 @@ from the charge region to the ground, forked, lighting the cloud from inside
 and dimmed by whatever cloud sits in front of it. Thunder is synthesised and
 arrives late by the distance divided by the speed of sound, low-passed with
 range so a near strike cracks and a far one rolls. Rain falls on the lens when
-you are under the precipitation core, and you can hear it.
+you are under the precipitation core, and you can hear it — the same field drives
+the volumetric shafts, the scope and the audio, so all three agree.
 
 ## How it renders
 
