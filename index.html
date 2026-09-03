@@ -212,6 +212,8 @@ body.touch #hint{display:none}
   </div>
 
   <div id="hud" aria-live="off">
+    <span class="k">time</span><span class="v" id="hTime">—</span>
+    <span class="k">sky</span><span class="v" id="hSky">—</span>
     <span class="k">range</span><span class="v" id="hRange">—</span>
     <span class="k">bearing</span><span class="v" id="hBear">—</span>
     <span class="k">storm mot</span><span class="v" id="hMot">—</span>
@@ -1434,9 +1436,9 @@ void main(){
   gHiH = uTop;
   if (uSuper > 0.0) gHiH = max(gHiH, uEL + 5400.0);
   if (uFogD  > 0.0) gHiH = max(gHiH, uFogLvl + 90.0);
-  if (uAltoc > 0.0) gHiH = max(gHiH, 5350.0);
+  if (uAltoc  > 0.0) gHiH = max(gHiH, 5350.0);
+  if (uCirrus > 0.0) gHiH = max(gHiH, 11000.0);
   if (uAsh   > 0.0) gHiH = max(gHiH, 16500.0);
-  if (uCirrus > 0.0) gHiH = max(gHiH, uTop);
 
   vec2 jit = vec2(hash12(gl_FragCoord.xy + uFrame * 7.13),
                   hash12(gl_FragCoord.xy + uFrame * 3.71 + 19.7));
@@ -1743,6 +1745,7 @@ const S = {
   super: 0, torn: 0, micro: 0, haboob: 0, ash: 0, fuji: 0,
   sprite: 0, nlc: 0, ball: 0,
   drift: 1, chase: 0, ltg: 1, sound: 0, scope: 1,
+  live: 0, tod: 8.6, rate: 150,
   quality: 1
 };
 // Phenomena ease in and out instead of popping, which also gives the
@@ -1787,7 +1790,6 @@ function recompute() {
   derived.top  = derived.base + Math.max(260, depth);
   derived.EL   = Math.min(15500, derived.base + 1800 + S.cape * 3.4);
   derived.wMax = Math.sqrt(2 * S.cape);
-  if (A.cirrus > 0.01) derived.top = Math.max(derived.top, 9000 + 2000 * A.cirrus);
   const el = S.sunElev * Math.PI / 180, az = S.sunAz * Math.PI / 180;
   derived.sun = [Math.cos(el) * Math.sin(az), Math.sin(el), Math.cos(el) * Math.cos(az)];
   const wd = (S.windDir + 180) * Math.PI / 180;
@@ -2123,6 +2125,208 @@ function rainAtCamera() {
        * (1 - smoothstepJS(derived.base, derived.base + 900, cam.pos[1]));
 }
 
+
+/* ══════════════════════════ live weather ══════════════════════════ */
+/* Not a preset, and not a loop: a small atmosphere integrated forward in time.
+   The sun heats the ground; the ground grows a mixed layer; when that layer
+   reaches its condensation level, cumulus appear; if it keeps growing past the
+   morning inversion, they deepen into a storm; the storm eats the instability
+   that made it and dies; at sunset the layer collapses, the cumulus evaporate,
+   and the ground radiates its heat away until the air reaches its dew point
+   and fog forms in the valleys. Every visible change is downstream of that one
+   chain, and the air mass it runs in drifts on several incommensurate clocks,
+   so no two days come out the same. */
+const D2R = Math.PI / 180, R2D = 180 / Math.PI;
+const WX = {
+  t: 8.6, day: 0,
+  T: 10, Td: 9, cape: 0, cin: 240, cov: 0, zi: 320,
+  cell: 0, cellAge: 0, cellLife: 55, anvil: 0, gap: 0.5,
+  seed: Math.random() * 977, phase: "clear", note: ""
+};
+/* Sliders the engine writes. Touching one of these hands control back to you. */
+const WX_DRIVEN = new Set(["dewDep","cape","coverage","stratus","cirrus",
+                           "windSpd","windDir","shear","sunElev","sunAz","virga"]);
+
+/* The air mass: moisture, wind, shear and the strength of the morning cap,
+   each on its own slow clock. Incommensurate periods mean the pattern never
+   closes, so the sim keeps producing days it has not produced before. */
+function wxSynoptic(){
+  const d = WX.day + WX.t / 24, k = WX.seed;
+  const w = (p, o) => 0.5 + 0.5 * Math.sin(d * p + k * o);
+  WX.moist  = 0.30 + 0.66 * w(2.13, 1.0);
+  WX.wBase  = 1.6 + 11.0 * w(1.37, 1.7);
+  WX.shearB = 0.6 + 9.0 * w(0.83, 2.3);
+  WX.dirB   = 205 + 150 * Math.sin(d * 0.61 + k * 0.9);
+  WX.cap    = 0.20 + 0.75 * w(1.71, 3.1);
+  WX.TdAir  = 4.5 + 11.5 * WX.moist;
+  WX.Tnight = 3.5 + 9.5 * WX.moist;
+}
+
+function wxIntegrate(dh){
+  WX.t += dh;
+  while (WX.t >= 24){ WX.t -= 24; WX.day++; }
+  wxSynoptic();
+
+  // ── where the sun is ────────────────────────────────────────────────────
+  const LAT = 43 * D2R, DEC = 15.5 * D2R;
+  const H = (WX.t - 12) * 15 * D2R;
+  const cd = Math.cos(DEC), sd = Math.sin(DEC), cl = Math.cos(LAT), sl = Math.sin(LAT);
+  const sunE = -cd * Math.sin(H);
+  const sunN =  sd * cl - cd * sl * Math.cos(H);
+  const sunU =  sd * sl + cd * cl * Math.cos(H);
+  S.sunElev = Math.asin(Math.max(-1, Math.min(1, sunU))) * R2D;
+  S.sunAz   = ((Math.atan2(sunE, sunN) * R2D) % 360 + 360) % 360;
+  const insol = Math.max(0, sunU);
+
+  // ── the ground heats and cools, and lags ────────────────────────────────
+  // A first-order lag is the whole reason the hottest hour is mid-afternoon
+  // rather than noon, and the coldest is just before dawn rather than midnight.
+  const lag = tc => 1 - Math.exp(-dh / tc);
+  WX.T  += ((WX.Tnight + 20.5 * insol) - WX.T) * lag(1.30);
+  WX.Td += ((WX.TdAir + 1.7 * insol - (insol < 0.03 ? 1.3 : 0)) - WX.Td) * lag(2.4);
+  // Air cannot hold a dew point above its own temperature: cool it past
+  // saturation and the excess condenses out, which is the fog.
+  WX.Td = Math.min(WX.Td, WX.T);
+  S.dewDep = Math.max(0.3, Math.min(32, WX.T - WX.Td));
+
+  // ── the mixed layer, and the level it has to reach to make cloud ────────
+  const lcl = Math.max(140, 125 * S.dewDep);
+  WX.zi += ((300 + 136 * Math.max(0, WX.T - WX.Tnight)) - WX.zi) * lag(0.75);
+  const reach = WX.zi / Math.max(lcl, 1);
+
+  // The morning inversion: a warm layer aloft that a rising parcel has to punch
+  // through. It is broken by the surface warming, not by the hour, which is why
+  // a capped day sits under a sheet of humilis all morning and then goes up at
+  // two o'clock all at once — and why a day that never quite warms enough stays
+  // blue and boring however much moisture is underneath it.
+  const warmed = Math.max(0, WX.T - WX.Tnight) / 20.5;
+  WX.cin = 400 * WX.cap * (1 - smoothstepJS(0.50, 0.93, warmed));
+  const uncapped = 1 - smoothstepJS(30, 200, WX.cin);
+
+  // ── instability: built by heating, spent by convection ──────────────────
+  const capePot = 4300 * WX.moist * smoothstepJS(0.50, 1.60, reach)
+                       * smoothstepJS(2, 14, WX.T - WX.Tnight);
+  WX.cape += (capePot - WX.cape) * lag(0.9);
+  WX.cape  = Math.max(0, WX.cape - 2200 * WX.cell * dh);
+  S.cape   = Math.max(60, WX.cape * (0.09 + 0.91 * uncapped));
+
+  // ── wind: momentum mixes down by day, decouples at night ────────────────
+  const mixdown = smoothstepJS(0.04, 0.55, insol);
+  S.windSpd = Math.max(0.4, WX.wBase * (0.32 + 0.78 * mixdown) + 4.0 * WX.cell);
+  S.windDir = ((WX.dirB % 360) + 360) % 360;
+  S.shear   = WX.shearB;
+
+  // ── how much sky the cumulus cover ──────────────────────────────────────
+  // No thermals, no cumulus: the field goes away at sunset because the thing
+  // building it does, not because a clock says so.
+  // Deep convection organises into fewer, larger cells with more clear sky
+  // between them: a sky of humilis is half cloud, a sky of cumulonimbus is
+  // three towers and a lot of blue.
+  const depth0 = 240 + WX.cape * 0.78;
+  const covT = Math.max(0, Math.min(1, (WX.zi - lcl) / 900))
+             * (0.19 + 0.40 * WX.moist) * smoothstepJS(0.02, 0.22, insol)
+             * (1 - 0.35 * smoothstepJS(1100, 3300, depth0));
+  WX.cov += (covT - WX.cov) * lag(0.55);
+  // Saturated air near the ground goes one of two ways, and the wind decides
+  // which: stir it and the condensation level lifts into a sheet of stratus,
+  // leave it alone and it condenses in place as fog.
+  S.stratus  = Math.min(0.92, smoothstepJS(4.6, 1.1, S.dewDep) * 0.9 * WX.moist
+                            * smoothstepJS(2.2, 7.0, S.windSpd));
+  S.coverage = Math.min(0.95, Math.max(WX.cov, S.stratus * 0.72));
+
+  // ── the convective cell ─────────────────────────────────────────────────
+  // A pulse cell lives about fifty minutes: it goes up, it rains, the rain-
+  // cooled downdraft cuts off its own inflow and it dies. Shear separates the
+  // updraft from the downdraft so that cannot happen, which is exactly why a
+  // sheared storm lasts hours instead of minutes.
+  const steady = smoothstepJS(4.5, 8.0, S.shear);
+  if (WX.cell <= 0.0005){
+    WX.gap -= dh;
+    if (WX.gap <= 0 && S.cape > 820 && uncapped > 0.55 && WX.cov > 0.13 && insol > 0.10){
+      WX.cell = 0.0006; WX.cellAge = 0;
+      WX.cellLife = (32 + 24 * Math.random()) * (1 + 3.4 * steady);
+      // Put it upwind, so it comes to you rather than away from you.
+      const gw = windUnit(), r = 15000 + Math.random() * 17000;
+      const j = (Math.random() - 0.5) * 1.3, cj = Math.cos(j), sj = Math.sin(j);
+      stormXZ = [cam.pos[0] + (-gw[0] * cj + gw[1] * sj) * r,
+                 cam.pos[2] + (-gw[1] * cj - gw[0] * sj) * r];
+    }
+  } else {
+    WX.cellAge += dh * 60;
+    const f = WX.cellAge / WX.cellLife;
+    let amp;
+    if (f < 0.26)      amp = smoothstepJS(0.0, 0.26, f) * 0.52;          // towering cumulus
+    else if (f < 0.72) amp = 0.52 + 0.48 * smoothstepJS(0.26, 0.46, f);  // mature, raining
+    else               amp = 1 - smoothstepJS(0.72, 1.04, f);            // dissipating
+    WX.cell = Math.max(0, Math.min(1, amp));
+    if (f >= 1.04){
+      WX.cell = 0; WX.cellAge = 0;
+      WX.gap = 0.35 + Math.random() * 1.15;
+      WX.anvil = Math.min(1, WX.anvil + 0.6);        // the anvil outlives the storm
+    }
+  }
+  S.super = WX.cell * smoothstepJS(650, 1400, S.cape);
+
+  // ── leftovers: orphaned anvil turning to cirrus, and dry-air virga ───────
+  WX.anvil = Math.max(0, WX.anvil - dh * 0.28);
+  S.cirrus = Math.min(1, WX.anvil * 0.85 + 0.30 * Math.max(0, WX.moist - 0.55));
+  S.virga  = Math.min(1, smoothstepJS(9, 16, S.dewDep) * smoothstepJS(0.14, 0.48, WX.cov)
+                       * (1 - WX.cell * 0.7));
+
+  S.tod = WX.t;
+  wxLabel(lcl);
+}
+
+/* What to call what is in the sky, in the terms a forecaster would use. */
+function wxLabel(lcl){
+  const dep = Math.max(260, (240 + S.cape * 0.78) * (1 - 0.55 * S.stratus));
+  const capped = WX.cin > 110 && WX.cov > 0.08;
+  let p;
+  if (derived.fog > 0.32)                       p = "radiation fog";
+  else if (WX.cell > 0.42 && S.cape > 1900 && S.shear > 6) p = "supercell";
+  else if (WX.cell > 0.42)                      p = "cumulonimbus";
+  else if (WX.cell > 0.02)                      p = "towering cumulus";
+  else if (S.stratus > 0.45)                    p = "stratus";
+  else if (WX.cov < 0.045)                      p = S.cirrus > 0.30 ? "cirrus" : "clear";
+  else if (dep > 2600)                          p = "cumulus congestus";
+  else if (dep > 1150)                          p = "cumulus mediocris";
+  else                                          p = "cumulus humilis";
+  WX.phase = p;
+  WX.note  = capped && WX.cell <= 0.02 ? "capped" :
+             (WX.cell > 0.02 && WX.cellAge / WX.cellLife > 0.72) ? "dissipating" : "";
+}
+
+/* Jump the clock. The state is integrated, so it has to be walked forward from
+   a few hours back or the temperature would arrive at the wrong lag. */
+function wxSeek(hour){
+  WX.t = hour - 6;
+  if (WX.t < 0){ WX.t += 24; WX.day = Math.max(0, WX.day - 1); }
+  for (let i = 0; i < 120; i++) wxIntegrate(0.05);
+  WX.t = hour; S.tod = hour;
+}
+function wxStart(hour){
+  WX.day = 0;
+  // Start day one on an air mass with enough water in it to make cloud, and let
+  // the synoptic clocks wander off from there. Only the moisture term is
+  // pinned; the wind, shear and cap phases stay free, so the first day is a
+  // convective day but not a particular one.
+  const m0 = 0.60 + Math.random() * 0.28;
+  WX.seed = Math.asin(Math.max(-1, Math.min(1, 2 * m0 - 1))) - (hour / 24) * 2.13
+          + Math.round(Math.random() * 5) * 2 * Math.PI;
+  WX.T = 8; WX.Td = 7; WX.cape = 0; WX.cin = 300; WX.cov = 0; WX.zi = 300;
+  WX.cell = 0; WX.cellAge = 0; WX.anvil = 0; WX.gap = 0.4;
+  wxSeek(hour);
+}
+function stepWeather(dtReal){
+  if (S.live < 0.5 || frozen) return;
+  const dh = Math.min(0.30, dtReal * S.rate / 3600);
+  if (dh > 0) wxIntegrate(dh);
+}
+function fmtClock(h){
+  const hh = Math.floor(((h % 24) + 24) % 24), mm = Math.floor((h - Math.floor(h)) * 60);
+  return (hh < 10 ? "0" : "") + hh + ":" + (mm < 10 ? "0" : "") + mm;
+}
+
 /* ══════════════════════════ audio ══════════════════════════ */
 const AU = { ctx: null, on: false };
 function audioInit() {
@@ -2202,77 +2406,85 @@ const SCENARIOS = [
     desc:"A shallow convective field on a summer afternoon. Move the dew point and watch every base move together.",
     set:{ dewDep:11, cape:520, coverage:0.44, stratus:0, cirrus:0, windSpd:6, windDir:215, shear:2,
           sunElev:44, sunAz:130, haze:0.5, terrain:800, ground:0.15, snow:2600, sea:-15,
-          altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+          live:0,altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
     storm:[6000,9000], cam:[0,2950,-9000], look:[0,1650,4000] },
 
   { id:"super", hue:"var(--b)", name:"Supercell", tag:"Tier B · rotating storm", g:G.super,
     desc:"3200 J/kg of CAPE under 25 m/s of shear, from 30 km out. Broad glaciated canopy, rough overshooting top, wide rain-filled base.",
     set:{ dewDep:8, cape:3200, coverage:0.30, stratus:0, cirrus:0, windSpd:15, windDir:200, shear:7,
           sunElev:17, sunAz:150, haze:0.33, terrain:300, ground:0.35, snow:6000, sea:-400,
-          altoc:0,bow:1,virga:1,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:1,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+          live:0,altoc:0,bow:1,virga:1,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:1,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
     storm:[4000,6000], cam:[-21000,9200,-24000], look:[4000,11600,6000] },
 
   { id:"torn", hue:"var(--b)", name:"Tornado", tag:"Tier B · condensation funnel", g:G.torn,
     desc:"A low condensation level lets the funnel reach the ground. Raise the dew-point depression and it lifts.",
     set:{ dewDep:6, cape:3600, coverage:0.22, stratus:0, cirrus:0, windSpd:14, windDir:200, shear:8,
           sunElev:17, sunAz:255, haze:0.5, terrain:140, ground:0.4, snow:6000, sea:-400,
-          altoc:0,bow:1,virga:1,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:1,torn:1,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+          live:0,altoc:0,bow:1,virga:1,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:1,torn:1,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
     storm:[1200,2200], cam:[-600,330,-2900], look:[1200,900,2200] },
 
   { id:"haboob", hue:"var(--b)", name:"Haboob", tag:"Tier B · density current", g:G.haboob,
     desc:"A gravity current running out ahead of a dying storm, lofting a wall of dust with a rolling head.",
     set:{ dewDep:24, cape:900, coverage:0.14, stratus:0, cirrus:0, windSpd:17, windDir:180, shear:2,
           sunElev:11, sunAz:250, haze:0.6, terrain:180, ground:0.95, snow:9000, sea:-400,
-          altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:1,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+          live:0,altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:1,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
     storm:[0,14000], front:-1400, cam:[0,340,3000], look:[0,1900,-9000] },
 
   { id:"ash", hue:"var(--b)", name:"Ash Column", tag:"Tier B · plume + discharge", g:G.ash,
     desc:"A buoyant plume spreading into an umbrella at its neutral buoyancy level, lit from inside by its own lightning.",
     set:{ dewDep:14, cape:400, coverage:0.18, stratus:0, cirrus:0, windSpd:9, windDir:210, shear:3,
           sunElev:23, sunAz:265, haze:0.55, terrain:520, ground:0.35, snow:2400, sea:-400,
-          altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:1,fuji:0,sprite:0,nlc:0,ball:0 },
+          live:0,altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:1,fuji:0,sprite:0,nlc:0,ball:0 },
     storm:[0,0], cam:[-9000,1500,-9000], look:[0,6500,0] },
 
   { id:"fog", hue:"var(--a)", name:"Sea of Fog", tag:"Tier A · radiation fog", g:G.fog,
     desc:"Cold air draining into the valleys overnight, with the sun just clearing the ridge. Look away from it for the glory.",
     set:{ dewDep:14, cape:150, coverage:0.22, stratus:0.6, cirrus:0, windSpd:2, windDir:90, shear:1,
           sunElev:5, sunAz:95, haze:0.45, terrain:1200, ground:0.1, snow:2800, sea:-400,
-          altoc:0,bow:1,virga:0,fog:1,halo:0,glory:1,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+          live:0,altoc:0,bow:1,virga:0,fog:1,halo:0,glory:1,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
     storm:[6000,9000], cam:[-2400,1450,-1200], look:[4000,300,3500] },
 
   { id:"ice", hue:"var(--a)", name:"Ice Optics", tag:"Tier A/C · halo, dogs, pillars", g:G.ice,
     desc:"A cirrostratus veil of hexagonal prisms. The 22° ring, its parhelia and a pillar from the oriented plates.",
     set:{ dewDep:16, cape:80, coverage:0.30, stratus:0.85, cirrus:1, windSpd:11, windDir:250, shear:2,
           sunElev:7, sunAz:0, haze:0.4, terrain:380, ground:0.0, snow:500, sea:-400,
-          altoc:0,bow:1,virga:0,fog:0,halo:1,glory:0,pillar:1,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+          live:0,altoc:0,bow:1,virga:0,fog:0,halo:1,glory:0,pillar:1,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
     storm:[6000,9000], cam:[0,950,-4000], look:[0,1500,4000] },
 
   { id:"tle", hue:"var(--c)", name:"Night Sky", tag:"Tier C · sprites, NLC", g:G.tle,
     desc:"Deep twilight. A distant mesoscale system throwing sprites into the mesosphere, with noctilucent cloud above it.",
     set:{ dewDep:9, cape:2600, coverage:0.30, stratus:0, cirrus:0, windSpd:10, windDir:200, shear:5,
           sunElev:-9, sunAz:320, haze:0.3, terrain:600, ground:0.2, snow:2600, sea:-400,
-          altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:1,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:1,nlc:1,ball:0 },
+          live:0,altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:1,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:1,nlc:1,ball:0 },
     storm:[30000,26000], cam:[-6000,2000,-10000], look:[30000,33000,26000] },
+
+  { id:"live", hue:"var(--b)", name:"Live Sky", tag:"a day, integrated forward", g:G.cumulus,
+    desc:"Nothing here is set. A clear morning at 08:35: the ground warms, the mixed layer grows, and when it reaches its condensation level the first cumulus appear. Whether they stay humilis or go up as a storm depends on the moisture and the cap the air mass happens to be carrying — and on the clock, because everything is gone again by dusk. Press L anywhere to switch it on.",
+    set:{ dewDep:9, cape:120, coverage:0.05, stratus:0, cirrus:0, windSpd:4, windDir:215, shear:3,
+          sunElev:22, sunAz:100, haze:0.42, exposure:1.0, terrain:900, ground:0.18, snow:3200, sea:-400,
+          live:1, tod:8.58, rate:150,
+          altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+    storm:[14000,16000], cam:[-1600,2250,-9500], look:[2600,3100,3000] },
 
   { id:"rain", hue:"var(--a)", name:"Rainband", tag:"Tier A · shafts & the bow", g:G.rain,
     desc:"A deep, well-covered deck letting go. Curtains lean downwind as they fall, scud hangs under the base, and with the sun low behind you the 42° bow stands on the rain.",
     set:{ dewDep:17, cape:2600, coverage:0.72, stratus:0.12, cirrus:0, windSpd:11, windDir:272, shear:4,
           sunElev:14, sunAz:272, haze:0.22, terrain:620, ground:0.22, snow:3600, sea:-400,
-          altoc:1,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+          live:0,altoc:1,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
     storm:[6000,9000], cam:[-15000,1780,1400], look:[9000,420,-600] },
 
   { id:"dusk", hue:"var(--a)", name:"Valley Dusk", tag:"Tier A · fog forming", g:G.fog,
     desc:"Nothing is switched on here. The ground is radiating, the dew-point depression is 3 K and the wind has dropped below 2 m/s — so fog forms, and ponds level in the valleys while the ridges stay clear. Raise the wind and watch it mix away.",
     set:{ dewDep:3, cape:120, coverage:0.16, stratus:0.15, cirrus:0.35, windSpd:1.4, windDir:140, shear:1,
           sunElev:4.0, sunAz:285, haze:0.30, exposure:1.5, terrain:1050, ground:0.08, snow:3000, sea:-400,
-          altoc:0,bow:0,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+          live:0,altoc:0,bow:0,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
     storm:[6000,9000], cam:[-10600,700,-1200], look:[2000,170,600] },
 
   { id:"lee", hue:"var(--a)", name:"Lee Wave", tag:"Tier A · lenticular stack", g:G.lee,
     desc:"A standing gravity wave over the ridge. The air moves through at 22 m/s; the cloud does not move at all.",
     set:{ dewDep:13, cape:200, coverage:0.16, stratus:0.2, cirrus:0, windSpd:22, windDir:250, shear:4,
           sunElev:21, sunAz:225, haze:0.45, terrain:1300, ground:0.1, snow:2200, sea:-400,
-          altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:1,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+          live:0,altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:1,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
     storm:[6000,9000], cam:[3000,2900,-21000], look:[-11000,4200,-9000] }
 ];
 
@@ -2382,7 +2594,9 @@ const SLIDERS = [
   { g:"Light & air", h:"--a", k:"exposure", l:"exposure",      min:.3,max:2.5, st:.02,f:v=>v.toFixed(2) },
   { g:"Terrain", h:"--c", k:"terrain", l:"relief",     min:0,   max:2400, st:20, f:v=>v.toFixed(0)+" m" },
   { g:"Terrain", h:"--c", k:"ground",  l:"aridity",    min:0,   max:1,    st:.01,f:v=>(v*100).toFixed(0)+" %" },
-  { g:"Terrain", h:"--c", k:"snow",    l:"snow line",  min:200, max:9000, st:50, f:v=>v>=8900?"none":v.toFixed(0)+" m" }
+  { g:"Terrain", h:"--c", k:"snow",    l:"snow line",  min:200, max:9000, st:50, f:v=>v>=8900?"none":v.toFixed(0)+" m" },
+  { g:"Live sky", h:"--b", k:"tod",  l:"time of day", min:0, max:23.99, st:.01, f:v=>fmtClock(v) },
+  { g:"Live sky", h:"--b", k:"rate", l:"clock speed", min:0, max:900, st:5, f:v=>v<1?"paused":"× "+v.toFixed(0) }
 ];
 const CHIPS = [
   { g:"Tier A · baseline & optics", h:"--a",
@@ -2393,7 +2607,9 @@ const CHIPS = [
   { g:"Tier C · rare & upper air", h:"--c",
     items:[["sprite","Red sprites"],["nlc","Noctilucent"],["ball","Ball lightning"],["cavum","Fallstreak hole"],["glory","Glory"],["pillar","Light pillars"]] },
   { g:"The chase", h:"--b",
-    items:[["ltg","Lightning"],["drift","Storm motion"],["chase","Chase lock (F)"],["scope","Radar (R)"],["sound","Sound"]] }
+    items:[["ltg","Lightning"],["drift","Storm motion"],["chase","Chase lock (F)"],["scope","Radar (R)"],["sound","Sound"]] },
+  { g:"Live sky", h:"--b",
+    items:[["live","Live weather (L)"]] }
 ];
 
 const panel = document.getElementById("panel");
@@ -2419,7 +2635,15 @@ const sliderEls = {}, chipEls = {};
       inp.min = s.min; inp.max = s.max; inp.step = s.st; inp.value = S[s.k];
       const val = w.querySelector(".val");
       const sync = () => { val.textContent = s.f(S[s.k]); inp.value = S[s.k]; };
-      inp.addEventListener("input", () => { S[s.k] = parseFloat(inp.value); val.textContent = s.f(S[s.k]); accum = 0; });
+      inp.addEventListener("input", () => {
+        S[s.k] = parseFloat(inp.value); val.textContent = s.f(S[s.k]); accum = 0;
+        uiHold = performance.now() + 900;
+        if (s.k === "tod"){ if (S.live > 0.5) wxSeek(S.tod); return; }
+        if (s.k === "rate") return;
+        // The engine owns these while it is running, so taking hold of one
+        // hands control back to you instead of fighting the slider every frame.
+        if (S.live > 0.5 && WX_DRIVEN.has(s.k)) setLive(false);
+      });
       w.appendChild(inp); d.appendChild(w);
       sliderEls[s.k] = sync; sync();
     });
@@ -2442,6 +2666,7 @@ const sliderEls = {}, chipEls = {};
         if (k === "sound") { audioInit(); AU.on = S.sound > 0.5;
                              if (AU.ctx && AU.ctx.state === "suspended") AU.ctx.resume(); }
         if (k === "scope") document.getElementById("scope").classList.toggle("off", S.scope < 0.5);
+        if (k === "live" && S.live > 0.5) wxStart(S.tod);
         accum = 0;
       });
       chipEls[k] = b; row.appendChild(b);
@@ -2470,6 +2695,13 @@ const sliderEls = {}, chipEls = {};
   });
 })();
 
+let uiHold = 0;
+function setLive(on){
+  S.live = on ? 1 : 0;
+  if (chipEls.live) chipEls.live.setAttribute("aria-pressed", on ? "true" : "false");
+  if (on) wxStart(S.tod);
+  accum = 0;
+}
 function syncUI(){
   Object.keys(sliderEls).forEach(k => sliderEls[k]());
   Object.keys(chipEls).forEach(k => chipEls[k].setAttribute("aria-pressed", S[k] > 0.5 ? "true" : "false"));
@@ -2500,6 +2732,7 @@ function applyScenario(sc){
   cam.speed = 260;
   currentScn = sc;
   fogQuant = null;
+  if (S.live > 0.5) wxStart(S.tod);
   derived.fog = Math.min(1, S.fog);
   { const fd = fogDatum();
     derived.fogLvl = Math.max(S.sea + 25,
@@ -2555,6 +2788,7 @@ addEventListener("keydown", e => {
   if (e.code === "Escape"){ toMenu(); return; }
   if (e.code === "Tab"){ e.preventDefault(); togglePanel(); return; }
   if (e.code === "KeyF"){ S.chase = S.chase > 0.5 ? 0 : 1; syncUI(); return; }
+  if (e.code === "KeyL"){ setLive(S.live < 0.5); syncUI(); return; }
   if (e.code === "KeyR"){ S.scope = S.scope > 0.5 ? 0 : 1;
                           document.getElementById("scope").classList.toggle("off", S.scope < 0.5);
                           syncUI(); return; }
@@ -2685,13 +2919,19 @@ function frame(now){
   if (!frozen) tSim += dt;
   frameNo++;
 
-  // Phenomena ease toward their target so nothing pops into existence.
-  let easing = false;
+  if (!inMenu) stepWeather(dt);
+
+  // Phenomena ease toward their target so nothing pops into existence. What
+  // counts as "moving" is the RATE, not the distance left to travel: the live
+  // sky is always drifting a little, and treating that as motion would stop
+  // the accumulation buffer from ever converging.
+  let easeRate = 0;
   for (const k of EASED){
     const d = S[k] - A[k];
-    if (Math.abs(d) > 0.0015){ A[k] += d * Math.min(1, dt * 3.6); easing = true; }
+    if (Math.abs(d) > 0.0015){ const st = d * Math.min(1, dt * 3.6); A[k] += st; easeRate += Math.abs(st); }
     else A[k] = S[k];
   }
+  const easing = easeRate > dt * 0.06;
   recompute();
   updateTurrets(tSim);
   if (!frozen) stepEvents(dt, tSim);
@@ -2714,7 +2954,10 @@ function frame(now){
              || (S.drift > 0.5 && A.super > 0.02) || bolts.length > 0 || A.super > 0.02;
   if (busy) accum = 0; else accum++;
   const fast = Math.max(A.torn, A.micro, A.haboob, A.ash, A.super * 0.5);
-  const floor = frozen ? 0.03 : 0.06 + 0.22 * fast + Math.min(0.12, S.windSpd * 0.004);
+  // A fast clock is a time-lapse: the less real time each frame stands for,
+  // the less of the previous frame is still true.
+  const live = (S.live > 0.5 && !frozen) ? Math.min(0.45, S.rate / 900 * 0.5) : 0;
+  const floor = frozen ? 0.03 : 0.06 + 0.22 * fast + Math.min(0.12, S.windSpd * 0.004) + live;
   const blend = busy ? 0.55 : Math.max(1 / (accum + 1), floor);
 
   const b = basis();
@@ -2795,6 +3038,12 @@ function frame(now){
     document.getElementById("hBear").textContent  = active ? compass(brg) + " " + brg.toFixed(0) + "°" : "—";
     document.getElementById("hMot").textContent   = active
       ? (S.drift > 0.5 ? compass(mbrg) + " " + (mspd * 1.944).toFixed(0) + " kt" : "held") : "—";
+    const liveOn = S.live > 0.5;
+    document.getElementById("hTime").textContent = liveOn
+      ? fmtClock(WX.t) + (S.rate < 1 ? " ⏸" : "") : "—";
+    document.getElementById("hSky").textContent = liveOn
+      ? WX.phase + (WX.note ? " · " + WX.note : "") : "—";
+    if (liveOn && performance.now() > uiHold) syncUI();
     const f = document.getElementById("hFps");
     f.textContent = fpsShown; f.className = "v" + (fpsShown < 24 ? " warn" : "");
     if (q) q.textContent = rtW + " × " + rtH;
