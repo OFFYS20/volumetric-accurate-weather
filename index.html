@@ -788,9 +788,13 @@ float fogForm(vec3 p, float h, float lod){
   // some barely form. Varying the LEVEL rather than the density is what lets
   // ground emerge between the banks instead of the whole valley going white.
   float basin = smoothstep(0.20, 0.74, fbm2c(p.xz * 0.000024 + 4.7));
+  // A fog sea is not a poured surface. Cold air pools to a common level, but
+  // the top of the pool is where mixing is happening, and it billows: broad
+  // swells across a basin, and metre-scale relief on the swells.
   float lvl = uFogLvl - (1.0 - basin) * 280.0
             + 68.0 * fbm2c(p.xz * 0.000042 + vec2(uTime * 0.0028, 0.0))
-            + 14.0 * fbm2c(p.xz * 0.00036  - vec2(0.0, uTime * 0.011));
+            + 27.0 * fbm2c(p.xz * 0.00036  - vec2(0.0, uTime * 0.011))
+            + 11.0 * fbm2c(p.xz * 0.00125  + vec2(uTime * 0.019, uTime * 0.008));
   if (h > lvl) return 0.0;
   float g = terrainH(p.xz);
   if (h < g - 30.0) return 0.0;
@@ -1164,6 +1168,7 @@ const vec3  SOLAR = vec3(19.6, 19.9, 20.2);
 
 float gAero;          // aerosol load, from the haze control
 vec3  gAmbient;       // hemispheric sky irradiance, evaluated once per pixel
+float gJitter;        // per-pixel, per-frame offset for every stepped integral
 
 void densities(float h, out float dR, out float dM, out float dO){
   dR = exp(-h / HR);
@@ -1266,9 +1271,14 @@ void scatter(vec3 ro, vec3 rd, float tEnd, float jitter, bool shadowed,
     vec3 sM = vec3(BMS) * dM * gAero;
     vec3 ext = sR + sM + vec3(BMA) * dM * gAero + BO * dO;
 
-    vec3 sunT = sunTrans(h, mS);
-    if (shadowed) sunT *= cloudShadow(ro + rd * t);
-    vec3 inS = (sR * pR + sM * pM) * sunT + (sR + sM) * multiScatter(h, mS);
+    vec3 beam = sunTrans(h, mS);
+    vec3 sunT = shadowed ? beam * cloudShadow(ro + rd * t) : beam;
+    // Light that has scattered more than once still had to reach the air here
+    // in the first place, and at sunset it did so along the same long, red path
+    // as the direct beam. Leaving the higher orders untinted is what kept the
+    // whole sky bright blue after the sun had visibly gone orange.
+    vec3 msT = mix(vec3(1.0), beam, 0.78);
+    vec3 inS = (sR * pR + sM * pM) * sunT + (sR + sM) * multiScatter(h, mS) * msT;
 
     // Analytic segment integral, so a long step does not overshoot.
     vec3 sT = exp(-ext * dt);
@@ -1285,8 +1295,15 @@ vec3 skyAmbient(){
   float muS = uSun.y;
   vec3  Ts  = sunTrans(max(hgt(uCam), 0.0), muS);
   float lit = smoothstep(-0.34, 0.14, muS);
-  vec3  out_ = (vec3(1.0) - Ts) * vec3(0.42, 0.62, 1.0);
-  return SOLAR * (out_ * 0.20 * lit + vec3(0.0010, 0.0016, 0.0030) * (0.10 + 0.90 * lit));
+  // The blue half: light scattered out of the beam and still up there. It is
+  // weighted by what was left of the beam to scatter, or a sunset would go on
+  // filling shadows with noon-bright blue long after the sun had reddened.
+  vec3 blue = (vec3(1.0) - Ts) * vec3(0.42, 0.62, 1.0) * mix(vec3(1.0), Ts, 0.80);
+  // The warm half: once the sun is low the horizon itself is the brightest
+  // thing in the sky, and it is what actually lights the ground.
+  vec3 warm = Ts * vec3(1.00, 0.56, 0.24) * smoothstep(0.44, 0.02, muS) * 0.60;
+  return SOLAR * ((blue + warm) * 0.20 * lit
+                + vec3(0.0010, 0.0016, 0.0030) * (0.10 + 0.90 * lit));
 }
 
 vec3 starField(vec3 rd, float night){
@@ -1320,7 +1337,11 @@ vec3 starField(vec3 rd, float night){
 
 vec3 skyColour(vec3 rd){
   vec3 L, Tr;
-  scatter(uCam, rd, -1.0, 0.5, false, L, Tr);
+  // Jittered per pixel and per frame. Sixteen steps over a smooth gradient with
+  // the same offset everywhere lays visible contours across the sky; dithering
+  // where the steps fall turns those contours into noise the temporal buffer
+  // averages away within a few frames.
+  scatter(uCam, rd, -1.0, gJitter, false, L, Tr);
 
   float mu = dot(rd, uSun);
   // The solar disc: 0.53° across, limb-darkened. Its radiance is some hundreds
@@ -1444,16 +1465,21 @@ vec4 marchClouds(vec3 ro, vec3 rd, float tMax, float jitter, out float meanT){
     vec3 lum = vec3(0.0);
     for (int o = 0; o < 3; o++){
       float fo = float(o);
-      float an = pow(0.5, fo), bn = pow(0.68, fo), cn = pow(0.62, fo);
+      // Each successive order of scattering is attenuated less (an) and carries
+      // less energy (bn). The energy fall-off has to be the steeper of the two:
+      // when it is not, the barely-attenuated third order sets a bright floor
+      // that no amount of depth can get below, and the cloud loses its interior
+      // — every tower turns into the same even white as its own lit edge.
+      float an = pow(0.5, fo), bn = pow(0.50, fo), cn = pow(0.62, fo);
       float beer  = exp(-sunD * sigma * an);
-      float phase = dualPhase(cosT, 0.82 * cn, -0.28 * cn);
+      float phase = dualPhase(cosT, 0.86 * cn, -0.30 * cn);
       lum += sunC * beer * phase * bn;
     }
     // sunC is now an irradiance in physical units, so the scattered term needs
     // the 1/π that turns it into a radiance, and the octave weights need to sum
-    // to one rather than to 2.14 — otherwise every cloud in the scene sits ten
+    // to one rather than to 1.75 — otherwise every cloud in the scene sits ten
     // stops over the sky it is standing in front of.
-    lum *= 0.135;
+    lum *= 0.165;
     lum *= mix(1.0, powder, 0.85);
     lum *= mix(1.0, 0.15, pf);
     lum *= mix(1.0, 0.72, m.z);                       // ash barely multiple-scatters
@@ -1473,7 +1499,12 @@ vec4 marchClouds(vec3 ro, vec3 rd, float tMax, float jitter, out float meanT){
     vec3 skyAmb = ambientAt(hf);
     vec3 gndAmb = sunColour() * 0.045 * max(uSun.y, 0.0)
                 * mix(vec3(0.55, 0.60, 0.50), vec3(0.78, 0.64, 0.46), uGround);
-    vec3 amb = mix(gndAmb, skyAmb, mix(0.04, 1.0, m.w)) * 0.44 * mix(1.0, 0.60, m.z);
+    // Occlusion has to change how MUCH ambient arrives, not only its colour. A
+    // parcel with two kilometres of cloud stacked over it sees almost no sky at
+    // all; giving it the same amount as the top of the tower and merely tinting
+    // it warmer is what flattens a deep cloud into a cutout.
+    vec3 amb = mix(gndAmb, skyAmb, mix(0.04, 1.0, m.w))
+             * (0.30 + 0.70 * m.w) * 0.52 * mix(1.0, 0.60, m.z);
     float ext = sigma * m.x;
     float sT  = exp(-ext * dt);
     vec3  S   = alb * ext * (lum + amb);
@@ -1557,7 +1588,13 @@ vec3 shadeTerrain(vec3 p, vec3 rd, float t){
   // of metres of it however close it is, and every quantity below — the normal,
   // the detail, the self-shadow, the mottle — has to be filtered to this width
   // or it turns into speckle at range.
-  float foot = t * 0.0017 / max(-rd.y, 0.020);
+  // The footprint is not square: a grazing ray covers far more ground along the
+  // view than across it. Filtering isotropically to the long axis over-blurs
+  // the short one, and what survives is smeared into streaks running away from
+  // the camera. The geometric mean of the two axes is the usual compromise —
+  // it keeps some detail across the view and only mildly under-filters along
+  // it, which the temporal buffer then absorbs.
+  float foot = t * 0.0017 * inversesqrt(max(-rd.y, 0.020));
   float e = max(9.0 + t * 0.0022, foot * 0.85);
   float h  = terrainH(p.xz);
   vec3  n  = normalize(vec3(terrainH(p.xz - vec2(e, 0.0)) - terrainH(p.xz + vec2(e, 0.0)),
@@ -1800,6 +1837,7 @@ void main(){
   // aureole around the sun, how far a ridge stays visible — follows from that.
   gAero    = 0.16 + 2.1 * uHaze;
   gAmbient = skyAmbient();
+  gJitter  = hash12(gl_FragCoord.xy + uFrame * 11.37 + 5.1);
   gLoH = 0.0;
   if (uVirga <= 0.0 && uTorn <= 0.0 && uHaboob <= 0.0 && uMicro <= 0.0 && uAsh <= 0.0 &&
       uLent <= 0.0 && uFogD <= 0.0 && uPrecip <= 0.0 && uSuper <= 0.0)
