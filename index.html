@@ -428,7 +428,10 @@ void main(){
 <script id="fsMain" type="x-shader/x-fragment">#version 300 es
 precision highp float;
 precision highp sampler3D;
-out vec4 outColor;
+layout(location = 0) out vec4 outColor;
+// Distance to whatever dominates this pixel, so the resolve pass can find
+// where it was in the previous frame.
+layout(location = 1) out vec2 outAux;
 
 uniform vec2  uRes;
 uniform vec3  uCam;
@@ -1858,16 +1861,15 @@ void main(){
   col = max(col, 0.0);
   col = min(col, 128.0);                    // clamp only the fireflies, not the sun
 
-  vec4 hist = texture(uHist, gl_FragCoord.xy / uRes);
-  // Blend with weights that fall off as radiance rises. A straight lerp in
-  // linear space lets one bright stray sample dominate the average for the next
-  // dozen frames — the classic firefly that never quite fades.
-  float wa = (1.0 - uBlend) / (1.0 + dot(hist.rgb, vec3(0.2126, 0.7152, 0.0722)));
-  float wb =  uBlend        / (1.0 + dot(col,      vec3(0.2126, 0.7152, 0.0722)));
-  vec3  mixed = (hist.rgb * wa + col * wb) / max(wa + wb, 1e-6);
+  // Depth of what the pixel is actually looking at. Blended in reciprocal
+  // space across the cloud edge — averaging a cloud at 8 km with sky at 3000 km
+  // linearly would put the "surface" a thousand kilometres away.
+  float bg   = hitG ? tG : 3.0e6;
+  float invD = mix(1.0 / max(meanT, 1.0), 1.0 / bg, smoothstep(0.35, 0.80, cl.a));
   // Alpha carries the cloud transmittance, so the lightning pass knows what is
   // in front of a channel without needing a depth buffer.
-  outColor = vec4(mixed, mix(hist.a, cl.a * trA.g, uBlend));
+  outColor = vec4(col, cl.a * trA.g);
+  outAux   = vec2(1.0 / max(invD, 1.0e-7), 0.0);
 }
 </script>
 
@@ -1919,6 +1921,97 @@ void main(){
   // Alpha of the cloud buffer is transmittance: a channel behind cloud dims.
   float tr = texture(uCloud, gl_FragCoord.xy / uRes).a;
   outColor = vec4(c * vBright * uAmp * mix(0.10, 1.0, tr), 1.0);
+}
+</script>
+
+<script id="fsResolve" type="x-shader/x-fragment">#version 300 es
+/* Temporal resolve.
+
+   One frame of a raymarched atmosphere is one jittered sample per pixel, which
+   is nowhere near enough — the image only ever looked clean because it sat
+   still long enough to average a hundred of them, and the moment the camera
+   moved the whole history was thrown away and the noise came back. That is
+   backwards: almost everything visible in the previous frame is still visible
+   in this one, just somewhere else on screen.
+
+   So find where. The march writes the distance to whatever dominates each
+   pixel; with that and the previous frame's camera, the world point can be
+   projected back into the previous frame and the history read from where it
+   actually was. What that cannot handle is disocclusion — ground appearing
+   from behind a ridge, sky from behind a cloud — where the history is of
+   something else entirely. The fix is to clip the history into the range of
+   colours its neighbourhood in the CURRENT frame actually contains: if it
+   belongs, it is already inside and nothing happens; if it is a leftover of
+   something that has moved away, it gets pulled to the nearest plausible
+   value instead of smearing across the frame. */
+precision highp float;
+out vec4 outColor;
+uniform sampler2D uCur, uAux, uHist;
+uniform vec2  uRes;
+uniform float uBlend, uTanHalf, uReproj;
+uniform vec3  uCam, uPrevCam;
+uniform mat3  uBasis, uPrevBasis;
+
+float luma(vec3 c){ return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+void main(){
+  vec2 uv = gl_FragCoord.xy / uRes;
+  vec4 c  = texture(uCur, uv);
+
+  // What range of colour does this corner of the frame contain?
+  vec2 px = 1.0 / uRes;
+  vec3 m1 = vec3(0.0), m2 = vec3(0.0), mn = vec3(1e9), mx = vec3(-1e9);
+  for (int y = -1; y <= 1; y++){
+    for (int x = -1; x <= 1; x++){
+      vec3 s = texture(uCur, uv + vec2(float(x), float(y)) * px).rgb;
+      m1 += s; m2 += s * s;
+      mn = min(mn, s); mx = max(mx, s);
+    }
+  }
+  m1 /= 9.0; m2 /= 9.0;
+  vec3 sd = sqrt(max(m2 - m1 * m1, vec3(0.0)));
+  // Mean ± a bit over one standard deviation, never outside what is actually
+  // there. A plain min/max box is too permissive on a noisy frame: one bright
+  // stray sample widens it enough to let a ghost straight through.
+  vec3 lo = max(m1 - sd * 1.30, mn);
+  vec3 hi = min(m1 + sd * 1.30, mx);
+
+  vec2  huv = uv;
+  float valid = 1.0;
+  if (uReproj > 0.5){
+    vec2 ndc = uv * 2.0 - 1.0;
+    float asp = uRes.x / uRes.y;
+    ndc.x *= asp;
+    vec3 rd = normalize(uBasis * vec3(ndc * uTanHalf, 1.0));
+    float d = texture(uAux, uv).x;
+    // Past a million metres the parallax from one frame of camera travel is
+    // below a pixel, so the direction alone reprojects it — and asking for a
+    // world point three thousand kilometres away in float32 would not survive
+    // the subtraction anyway.
+    vec3 w = (d > 1.0e6) ? rd : (uCam - uPrevCam) + rd * d;
+    vec3 v = vec3(dot(w, uPrevBasis[0]), dot(w, uPrevBasis[1]), dot(w, uPrevBasis[2]));
+    if (v.z > 1.0e-4){
+      vec2 pn = vec2(v.x, v.y) / (v.z * uTanHalf);
+      pn.x /= asp;
+      huv = pn * 0.5 + 0.5;
+      // Fade out toward the frame edge rather than cutting: a hard boundary
+      // draws a visible seam of noise around the border while panning.
+      vec2 g = min(huv, 1.0 - huv);
+      valid = smoothstep(0.0, 1.5 * px.x, g.x) * smoothstep(0.0, 1.5 * px.y, g.y);
+    } else valid = 0.0;
+  }
+
+  vec4 h = texture(uHist, clamp(huv, vec2(0.0), vec2(1.0)));
+  vec3 hc = clamp(h.rgb, lo, hi);
+  float bl = mix(1.0, uBlend, valid);
+
+  // Weights that fall off as radiance rises: in linear space a straight lerp
+  // lets one stray bright sample dominate the running average for a dozen
+  // frames — the firefly that never quite fades.
+  float wa = (1.0 - bl) / (1.0 + luma(hc));
+  float wb =        bl  / (1.0 + luma(c.rgb));
+  outColor = vec4((hc * wa + c.rgb * wb) / max(wa + wb, 1e-6),
+                  mix(h.a, c.a, bl));
 }
 </script>
 
@@ -2188,13 +2281,14 @@ function program(vsSrc, fsSrc, name) {
 }
 const src = id => document.getElementById(id).textContent;
 
-let progMain, progNoise, progPresent, progBolt, progDown, progUp, progTrans;
+let progMain, progNoise, progPresent, progBolt, progDown, progUp, progTrans, progResolve;
 try {
   boot("compiling atmosphere shader…", 0.1);
   progNoise   = program(src("vs"), src("fsNoise"),   "noise");
   progMain    = program(src("vs"), src("fsMain"),    "main");
   progPresent = program(src("vs"), src("fsPresent"), "present");
   progTrans   = program(src("vs"), src("fsTrans"), "transmittance");
+  progResolve = program(src("vs"), src("fsResolve"), "resolve");
   progDown    = program(src("vs"), src("fsDown"), "bloom-down");
   progUp      = program(src("vs"), src("fsUp"),   "bloom-up");
   progBolt    = program(src("vsBolt"), src("fsBolt"), "bolt");
@@ -2348,6 +2442,16 @@ function makeTarget(w, h, hdr) {
 // Bloom pyramid: successive halvings of the frame, each its own target.
 const BLOOM_MAX = 6;
 let bloomLv = [];       // [{w,h,tex,fbo}], level 0 = half resolution
+// The march's own output, before the temporal resolve, plus the per-pixel
+// distance the resolve needs to find last frame's version of the same point.
+let sceneT = null, auxT = null, sceneF = null;
+// Reprojection needs somewhere to put a per-pixel distance, which means a
+// second render target holding real numbers. Without float attachments the
+// resolve still runs — it just reads the history straight back, as before.
+const reprojOK = hdrOK;
+let histValid = false;
+let prevCam = [0, 0, 0];
+let prevBasis = [1, 0, 0, 0, 1, 0, 0, 0, 1];
 function resizeTargets(w, h) {
   if (w === rtW && h === rtH) return;
   rtW = w; rtH = h;
@@ -2356,6 +2460,21 @@ function resizeTargets(w, h) {
     const [t, f] = makeTarget(w, h, hdrOK);
     rts[i] = t; fbos[i] = f;
   }
+  if (sceneT) { gl.deleteTexture(sceneT); gl.deleteTexture(auxT); gl.deleteFramebuffer(sceneF); }
+  sceneT = makeTarget(w, h, hdrOK)[0];
+  auxT = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, auxT);
+  gl.texStorage2D(gl.TEXTURE_2D, 1, hdrOK ? gl.RG16F : gl.RGBA8, w, h);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  sceneF = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, sceneF);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, sceneT, 0);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, auxT, 0);
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   for (const L of bloomLv) { gl.deleteTexture(L.tex); gl.deleteFramebuffer(L.fbo); }
   bloomLv = [];
   let bw = w, bh = h;
@@ -2365,7 +2484,7 @@ function resizeTargets(w, h) {
     bloomLv.push({ w: bw, h: bh, tex: t, fbo: f });
     if (bw <= 8 || bh <= 8) break;
   }
-  accum = 0;
+  accum = 0; histValid = false;
 }
 
 /* Build the pyramid: threshold on the way down, tent-filtered add on the way
@@ -3417,7 +3536,7 @@ function applyScenario(sc){
   { const fd = fogDatum();
     derived.fogLvl = Math.max(S.sea + 25,
                      fd.lo + Math.max(22.0, (0.10 + 0.30 * derived.fog) * fd.spread)); }
-  recompute(); syncUI(); accum = 0;
+  recompute(); syncUI(); accum = 0; histValid = false;
 }
 function launch(sc){
   applyScenario(sc);
@@ -3434,7 +3553,7 @@ function toMenu(){
   inMenu = true;
   document.getElementById("menu").classList.remove("hidden");
   document.getElementById("ui").classList.add("hidden");
-  accum = 0;
+  accum = 0; histValid = false;
 }
 
 /* ══════════════════════════ input ══════════════════════════ */
@@ -3544,7 +3663,7 @@ document.getElementById("phCopy").addEventListener("click", () => {
 });
 document.getElementById("menuBtn").addEventListener("click", toMenu);
 document.getElementById("resetCam").addEventListener("click", () => {
-  cam.pos = currentScn.cam.slice(); lookAt(currentScn.look); cam.speed = 260; accum = 0;
+  cam.pos = currentScn.cam.slice(); lookAt(currentScn.look); cam.speed = 260; accum = 0; histValid = false;
 });
 document.getElementById("freezeBtn").addEventListener("click", e => {
   frozen = !frozen; e.currentTarget.setAttribute("aria-pressed", frozen ? "true" : "false"); accum = 0;
@@ -3795,25 +3914,54 @@ function frame(now){
   // the less of the previous frame is still true.
   const live = (S.live > 0.5 && !frozen) ? Math.min(0.45, S.rate / 900 * 0.5) : 0;
   const floor = frozen ? 0.03 : 0.06 + 0.22 * fast + Math.min(0.12, S.windSpd * 0.004) + live;
-  const blend = busy ? 0.55 : Math.max(1 / (accum + 1), floor);
+  // Camera motion no longer throws the history away: the resolve pass finds
+  // where each point was last frame. A quarter of the frame is still enough to
+  // track a fast pan, and it leaves four samples of averaging behind it rather
+  // than the two that made every moving frame crawl.
+  const moveBlend = reprojOK ? 0.26 : 0.55;
+  const blend = busy ? (camMoved ? moveBlend : 0.55) : Math.max(1 / (accum + 1), floor);
 
   bakeTrans(aeroOf(S.haze));
 
   const b = basis();
-  gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[cur]);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, sceneF);
   gl.viewport(0, 0, rtW, rtH);
   gl.useProgram(progMain);
-  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, rts[1 - cur]);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_3D, texShape);
   gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_3D, texDetail);
   gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, texTrans);
-  gl.uniform1i(progMain.u.uHist, 0);
   gl.uniform1i(progMain.u.uShape, 1);
   gl.uniform1i(progMain.u.uDetail, 2);
   gl.uniform1i(progMain.u.uTrans, 3);
-  gl.uniform1f(progMain.u.uBlend, accum === 0 && !busy ? 1.0 : blend);
   setUniforms(b);
   drawQuad();
+
+  // ── temporal resolve: this frame's samples merged into the running average ──
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[cur]);
+  gl.viewport(0, 0, rtW, rtH);
+  gl.useProgram(progResolve);
+  const ru = progResolve.u;
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, sceneT);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, auxT);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, rts[1 - cur]);
+  gl.uniform1i(ru.uCur, 0);
+  gl.uniform1i(ru.uAux, 1);
+  gl.uniform1i(ru.uHist, 2);
+  gl.uniform2f(ru.uRes, rtW, rtH);
+  gl.uniform1f(ru.uTanHalf, Math.tan(0.50));
+  // First frame after a resize or a scenario change: there is no history worth
+  // keeping, so take this frame whole.
+  gl.uniform1f(ru.uBlend, histValid ? blend : 1.0);
+  gl.uniform1f(ru.uReproj, reprojOK && histValid ? 1 : 0);
+  gl.uniform3f(ru.uCam, cam.pos[0], cam.pos[1], cam.pos[2]);
+  gl.uniform3f(ru.uPrevCam, prevCam[0], prevCam[1], prevCam[2]);
+  gl.uniformMatrix3fv(ru.uBasis, false,
+    [b.r[0], b.r[1], b.r[2], b.u[0], b.u[1], b.u[2], b.f[0], b.f[1], b.f[2]]);
+  gl.uniformMatrix3fv(ru.uPrevBasis, false, prevBasis);
+  drawQuad();
+  histValid = true;
+  prevCam = cam.pos.slice();
+  prevBasis = [b.r[0], b.r[1], b.r[2], b.u[0], b.u[1], b.u[2], b.f[0], b.f[1], b.f[2]];
 
   const expo = S.exposure * 0.90;
   bloomPass(rts[cur], expo);
