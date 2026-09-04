@@ -633,13 +633,33 @@ bool traceTerrain(vec3 ro, vec3 rd, out float tHit, out vec3 pHit){
 }
 
 /* ─────────────────────────── medium ─────────────────────────── */
-float heightGradient(float hf, float st, float tall){
-  // `tall` lets one deck hold squat humilis and deep congestus at the same time,
-  // which is what a real convective field looks like from above.
-  float cum = smoothstep(0.0, 0.12 * tall, hf) * smoothstep(tall, tall * 0.55, hf);
-  float str = smoothstep(0.0, 0.05, hf) * smoothstep(1.0, 0.72, hf);
-  return mix(cum, str, st);
+/* Smooth union for coverage fields. A hard max() leaves a crease wherever two
+   primitives meet — that crease is precisely what makes a storm read as a
+   cylinder with slabs parked on it, and no amount of tuning the primitives can
+   remove a corner the combining operator is creating. This fillets the joins. */
+float smax(float a, float b, float k){
+  float t = clamp(0.5 + 0.5 * (a - b) / k, 0.0, 1.0);
+  return mix(b, a, t) + k * t * (1.0 - t);
 }
+
+/* ── the mesocyclone ──────────────────────────────────────────────────────
+   A supercell's updraft is a vortex, and a vortex is not a turning disc.
+   Inside a core radius it rotates as a solid body; outside it, angular
+   momentum is conserved, so the tangential speed falls as 1/r and the angular
+   RATE as 1/r². The inner air therefore laps the outer air, and that
+   difference is the entire reason a rotating storm winds its base into a
+   spiral and stacks its updraft into striations instead of turning rigidly.
+
+   Returns radians per second at radius r. Everything that rotates with the
+   storm — the noise it is carved from, the turrets orbiting its flank, the
+   banding up its tower, the wall cloud under it — reads this one function, so
+   they cannot disagree about how fast the thing is going round. */
+float mesoRate(float r){
+  float rc  = max(uCore * 0.40, 200.0);       // core radius
+  const float vmx = 34.0;                     // peak tangential speed, m/s
+  return (r < rc) ? (vmx / rc) : (vmx * rc / max(r * r, 1.0));
+}
+float mesoSpin(float r){ return uTime * mesoRate(r) * uSuper; }
 
 /* Layered cloud coverage as a 0..1 "how much cloud wants to be here" field. */
 float layerForm(vec3 p, float h, float hf){
@@ -662,22 +682,98 @@ float layerForm(vec3 p, float h, float hf){
     float hole = smoothstep(2100.0 * uCavum, 3400.0 * uCavum, r);
     cov *= mix(1.0, hole, uCavum);
   }
-  // Large-scale character variation: parts of the field flatten toward
-  // stratocumulus, parts tower.
-  float typ  = fbm2c(q * 0.00007 + 31.7);
-  float st   = clamp(uStratus + (typ - 0.5) * 0.45, 0.0, 1.0);
-  float tall = mix(0.58, 1.18, smoothstep(0.32, 0.78, typ));
-  return cov * heightGradient(clamp(hf, 0.0, 1.0), st, tall);
+  if (cov <= 0.002) return 0.0;
+
+  /* ── a population of clouds, not one field carved into cloud shapes ──────
+     The deck used to be a single coverage field with a single height profile,
+     shaped by a single noise. That gives a hundred variations on one cloud:
+     every puff the same aspect ratio, the same top, the same erosion,
+     differing only in where the noise happened to be high. A real convective
+     field is a population — one flat and spreading, its neighbour going up
+     hard with a cauliflower top, a third already coming apart into scraps —
+     and the differences are per CLOUD, not per point.
+
+     So the plane is partitioned into cells, and each cell owns one cloud whose
+     identity is hashed out of its own index: how wide it is, how deep, where
+     its base sits relative to its neighbours', how stratiform it is, how far
+     it leans in the shear. One hash sliced several ways is enough; the
+     parameters only have to be uncorrelated enough that two adjacent clouds do
+     not read as the same cloud. */
+  float span = max(uTop - uBase, 200.0);
+  // Spacing scales with depth. Shallow cumulus crowd together; deep convection
+  // organises into fewer, larger cells with clear sky between them.
+  float SC = 700.0 + 1.7 * span;
+  // Warp the lattice before reading it. A regular grid of clouds is a grid
+  // however well each cloud is made, and the eye finds it immediately; a slow
+  // domain warp of about half a cell destroys the alignment without touching
+  // anything else.
+  vec2  wq = q + (vec2(vnoise2(q * 0.00026 + 9.1),
+                       vnoise2(q * 0.00026 + 21.7)) - 0.5) * SC * 0.85;
+  vec2  g  = wq / SC;
+  vec2  gi = floor(g), gf = fract(g);
+  float lean = uShear * span * 0.030 / SC;
+
+  float acc = 0.0;
+  for (int y = -1; y <= 1; y++){
+    for (int x = -1; x <= 1; x++){
+      vec2  o  = vec2(float(x), float(y));
+      float rr = hash12(gi + o + 0.37);
+      vec2  c  = o + vec2(fract(rr * 17.31), fract(rr * 91.77)) * 0.86 + 0.07;
+      // A cloud in shear leans: its top sits downwind of its base.
+      vec2  dd = gf - c - gWindDir * (hf * lean);
+      float q2 = dot(dd, dd);
+      if (q2 > 0.72) continue;                  // beyond any cloud's reach
+
+      float rt = fract(rr *  313.7);            // how deep
+      float rb = fract(rr * 1129.3);            // base offset
+      float rl = fract(rr * 4271.1);            // stratiform or cumuliform
+      float rk = fract(rr * 9721.7);            // how wide
+
+      float st = clamp(uStratus + (rl - 0.5) * 0.55, 0.0, 1.0);
+      // Squared, so most of the field is shallow and a few go up — which is
+      // what a convective field actually looks like from above.
+      float tall = mix(0.55, 1.45, rt * rt);
+      float hc = (hf - (rb - 0.5) * 0.13) / max(tall, 0.05);   // 0 at its base, 1 at its top
+      if (hc < -0.04 || hc > 1.04) continue;
+
+      // A cumulus is not a cylinder. It has a flat base where the air first
+      // reaches saturation, is widest not far above it, and closes into a domed
+      // cauliflower top — and a field of cylinders is exactly what one width
+      // per cloud gives you. A stratiform cell keeps its width instead: that is
+      // the difference between a deck and a field of pancakes.
+      // Full through the body and domed only near the top. A steeper taper
+      // makes cones, and a field of cones is no more a sky than a field of
+      // cylinders was.
+      float hcc   = clamp(hc, 0.0, 1.0);
+      float dome  = pow(1.0 - hcc, 0.42) * smoothstep(-0.05, 0.03, hc);
+      // Sized from what the coverage has to come out at: one cloud per cell of
+      // effective radius w covers πw² of the sky, so a 44% sky wants w near
+      // 0.37 of the spacing, and with the shoulder that means a nominal half.
+      // Neighbours therefore overlap and clump, which is what a convective
+      // field does — the individuality is in each cloud's own depth and base
+      // and top, not in it standing alone.
+      float wid   = mix(0.44 + 0.34 * rk, 0.90, st) * (0.72 + 0.28 * cov);
+      float rw    = wid * mix(dome, 1.0, st);
+      if (rw <= 0.012) continue;
+      float rad = sqrt(q2) / rw;
+      if (rad >= 1.0) continue;
+      // Solid through the body, with a shoulder over half the radius. This
+      // field is not the cloud — it is what the shape volume carves the cloud
+      // out of — so it has to stay high enough over a wide enough area for the
+      // carve to have something to bite on, while never presenting an edge
+      // sharp enough for the march's own steps to show through as terraces.
+      acc = smax(acc, smoothstep(1.0, 0.62, rad), 0.12);
+    }
+  }
+  // Scaled to the range the erosion expects. A field that peaks at 1.0 arrives
+  // at the carve already solid and comes out smooth-edged, so the march's own
+  // steps show through it as terraces; one that peaks too low is carved away to
+  // nothing. Coverage now sets how wide the clouds are rather than how much
+  // sky the field fills, so it only trims the density from here.
+  return clamp(acc * (0.20 + 0.68 * cov), 0.0, 1.0);
 }
 
-/* Smooth union for coverage fields. A hard max() leaves a crease wherever two
-   primitives meet — that crease is precisely what makes a storm read as a
-   cylinder with slabs parked on it, and no amount of tuning the primitives can
-   remove a corner the combining operator is creating. This fillets the joins. */
-float smax(float a, float b, float k){
-  float t = clamp(0.5 + 0.5 * (a - b) / k, 0.0, 1.0);
-  return mix(b, a, t) + k * t * (1.0 - t);
-}
+/* Moved above layerForm: the cloud population unions its cells with it. */
 
 /* The storm is ONE body, not an assembly. A single radius-versus-height profile
    runs from cloud base to the overshooting top: it widens as the updraft rises,
@@ -738,10 +834,20 @@ float stormForm(vec3 p, float h, out float ice, out float anvTop){
   }
   rTower *= 1.0 + lobes * 0.54;
 
+  // Striations. Air spiralling into a rotating updraft climbs it helically
+  // rather than rising straight, and the tower is banded by that — the
+  // corkscrew stack that tells you a storm is rotating from thirty kilometres
+  // away, before you can see anything turn. Because the mesocyclone's angular
+  // rate falls off with radius, subtracting it from the azimuth shears the
+  // bands into a spiral by itself; nothing has to be drawn as one. Integer
+  // harmonics of the azimuth only, so there is no seam where atan wraps.
+  float thS  = atan(d2.y + 1e-6, d2.x + 1e-6) - mesoSpin(r);
+  float band = sin(thS * 2.0 - (h - uBase) * 0.00115);
+
   // ── the canopy half of the same profile ────────────────────────────────
   vec2  ad2 = d2 - gWindDir * core * 0.95;
   vec2  wa  = vec2(dot(ad2, gWindDir) / 1.35, dot(ad2, vec2(-gWindDir.y, gWindDir.x)));
-  float ang = atan(wa.y, wa.x);
+  float ang = atan(wa.y + 1e-6, wa.x + 1e-6);
   float dw  = dot(normalize(ad2 + vec2(1e-4)), gWindDir);
   float tail = 1.0 + 0.95 * smoothstep(0.10, 1.0, dw);   // dragged out downwind
   float rim  = 0.78 + 0.44 * fbm2c(vec2(cos(ang), sin(ang)) * 1.8 + 7.3)
@@ -774,7 +880,10 @@ float stormForm(vec3 p, float h, out float ice, out float anvTop){
   // The cauliflower belongs to the convective part. Ice spreading out along the
   // tropopause is laminar, and knobbling its edge is exactly what makes an
   // anvil stop looking frozen.
-  rTower *= mix(0.82 + 0.36 * knob, 1.0, canopy);
+  // Both the cauliflower and the striations belong to the convective part. Ice
+  // spreading out along the tropopause is laminar: knobbling its edge is what
+  // makes an anvil stop looking frozen, and banding it would be worse.
+  rTower *= mix((0.82 + 0.36 * knob) * (1.0 + 0.13 * band), 1.0, canopy);
   float rBody = mix(rTower, max(anvR, rTower), canopy);
 
   // Overshooting top: the dome's ceiling lifted locally, upwind of centre. A
@@ -790,8 +899,10 @@ float stormForm(vec3 p, float h, out float ice, out float anvTop){
   float edge  = mix(0.58, 0.88, canopy);   // the canopy ends at a rim, the tower does not
   float body  = smoothstep(rBody, rBody * edge, r) * vProf;
 
-  // Turbulence belongs to the convective parts, not the frozen canopy.
-  float turb = 0.62 + 0.76 * knob;
+  // Turbulence belongs to the convective parts, not the frozen canopy. The
+  // banding shades as well as displaces: a striation is a step in the surface,
+  // and its underside is in the shadow of the one above.
+  float turb = (0.62 + 0.76 * knob) * (0.90 + 0.12 * band);
   body *= mix(turb, 0.96 + 0.08 * turb, canopy);
 
   // ── the base, blended in rather than stacked on ────────────────────────
@@ -799,9 +910,24 @@ float stormForm(vec3 p, float h, out float ice, out float anvTop){
   // storm gets a big wall cloud and a wide rain shelf instead of the same
   // small ones parked under a larger tower.
   float lower = uBase - min(380.0, uBase * 0.42);
-  float wall  = smoothstep(core * 0.62, core * 0.20, r)
-              * smoothstep(lower, lower + 320.0, h)
-              * smoothstep(uBase + 2400.0, uBase + 400.0, h) * 0.85 * turb;
+  // The wall cloud turns, and it turns faster than the tower above it because
+  // it sits nearer the axis. Sampling its texture in the ROTATING frame is what
+  // makes it read as a turning block rather than a lowered lump — and the tail
+  // cloud is the inflow being wound into it, so it spirals in from one side.
+  float wth  = atan(d2.y + 1e-6, d2.x + 1e-6) - mesoSpin(r) * 1.25;
+  float wSw  = 0.66 + 0.52 * fbm2c(vec2(cos(wth), sin(wth)) * 2.7
+                                 + vec2(h * 0.0011, r * 0.00042));
+  float tailC = smoothstep(1.35, 0.25, abs(mod(wth + PI, PI * 2.0) - PI))
+              * smoothstep(core * 1.55, core * 0.55, r) * 0.55;
+  // The lowering. A wall cloud is not a flat ceiling: it hangs distinctly lower
+  // right under the updraft, where the inflow is saturated at a level below the
+  // rest of the base, and that step is what the eye reads as the thing rotating.
+  float lowA  = lower - 260.0 * smoothstep(core * 0.55, core * 0.10, r);
+  float wall  = smoothstep(core * 0.66, core * 0.20, r) * wSw
+              * smoothstep(lowA, lowA + 320.0, h)
+              * smoothstep(uBase + 2400.0, uBase + 400.0, h) * 0.92 * turb;
+  wall = smax(wall, tailC * smoothstep(lower + 60.0, lower + 380.0, h)
+                          * smoothstep(uBase + 1500.0, uBase + 300.0, h) * turb, 0.22);
 
   vec2  sd = d2 - gWindDir * core * 0.62;              // precipitation falls downwind
   float sr = length(vec2(dot(sd, gWindDir) / 1.25, dot(sd, vec2(-gWindDir.y, gWindDir.x))));
@@ -822,28 +948,81 @@ float stormForm(vec3 p, float h, out float ice, out float anvTop){
   return clamp(total * uSuper * 0.94, 0.0, 1.0);
 }
 
+/* The vortex axis, as a function of height fraction. A vortex tube is advected
+   by the flow it stands in, and the foot lags the top, so it leans and snakes.
+   Shared, because the debris cloud has to be under the funnel rather than under
+   the mesocyclone's geometric centre. */
+vec2 funnelAxis(float f){
+  return uStorm
+       + vec2(sin(uTime * 0.11) * 190.0, cos(uTime * 0.09) * 190.0)
+       + gWindDir * (1.0 - f) * 210.0
+       + vec2(-gWindDir.y, gWindDir.x) * sin(f * 4.1 + uTime * 0.6) * 130.0 * (1.0 - f);
+}
+
+/* How far through its life the tornado is. A vortex that gets stretched spins
+   up and narrows, so one runs from a wedge nearly as wide as it is tall, through
+   a cone, to a rope a few tens of metres across trailing sideways — and it does
+   that in one direction, over several minutes. That progression is most of what
+   makes a tornado read as a process rather than a prop. */
+float tornStage(){ return 0.5 + 0.5 * sin(uTime * 0.019 + 1.7); }
+
+/* The condensation funnel.
+
+   The visible funnel is not the vortex: it is the surface inside which the
+   pressure deficit is deep enough for the air to reach saturation. It is never
+   a smooth cone. The core is turbulent, the surface is striated by its own
+   rotation, and a violent one is not a single vortex at all but two or three
+   suction vortices orbiting a common centre — which is the thing that makes
+   real footage read as violent rather than as a spinning traffic cone. */
 float funnelForm(vec3 p, float h){
-  if (uTorn <= 0.0 || h > uBase + 400.0) return 0.0;
+  if (uTorn <= 0.0 || h > uBase + 500.0) return 0.0;
   float f  = clamp(h / max(uBase, 1.0), 0.0, 1.0);
 
-  // The condensation funnel leans downwind and snakes; a vertical cylinder is
-  // the one shape a real vortex never has.
-  vec2 ax = uStorm
-          + vec2(sin(uTime * 0.11) * 190.0, cos(uTime * 0.09) * 190.0)
-          + gWindDir * (1.0 - f) * 210.0
-          + vec2(-gWindDir.y, gWindDir.x) * sin(f * 4.1 + uTime * 0.6) * 130.0 * (1.0 - f);
-  float r = length(p.xz - ax);
+  vec2  d = p.xz - funnelAxis(f);
+  float r = length(d);
 
-  // Radius follows the pressure deficit: a rope at the surface widening into the
-  // wall cloud. Aspect ratio matters more than absolute width — this is what
-  // separates it from the parent updraft.
-  float rf = mix(95.0, 430.0, pow(f, 1.5)) * (1.0 + 0.22 * sin(h * 0.0055 + uTime * 1.7));
+  float wedge = tornStage();
+  // Wide and near-cylindrical as a wedge; narrow and sharply tapered as a rope.
+  float rTop = mix(120.0, 430.0, wedge);
+  float rf   = rTop * pow(clamp(f, 0.03, 1.0), mix(1.05, 0.34, wedge));
+  // Where it meets the cloud it opens out into the wall cloud rather than
+  // ending at a rim: a funnel is the bottom of that lowering, not a pipe
+  // pushed into it.
+  rf *= 1.0 + 1.25 * pow(clamp((h - uBase + 40.0) / 520.0, 0.0, 1.0), 1.8);
+
+  // The surface turns fast enough to watch: seventy metres a second a hundred
+  // out is a full revolution every nine seconds, and it is that, not the shape,
+  // that says what the thing is.
+  float spin = uTime * 0.62;
+  float th   = atan(d.y + 1e-6, d.x + 1e-6) - spin;
+  float stri = 0.90 + 0.15 * sin(th * 3.0 - h * 0.011);
+  float ruff = 0.84 + 0.32 * fbm2c(vec2(cos(th) * 2.4 + h * 0.0016,
+                                        sin(th) * 2.4 - uTime * 0.28));
+  float rr   = rf * stri * ruff;
+
+  rr = max(rr, 8.0);                       // never a zero-width smoothstep
+  float core = smoothstep(rr, rr * 0.42, r);
+
+  // Suction vortices: a ring of smaller vortices orbiting inside the parent,
+  // each with its own condensation. They only appear on a violent one, and they
+  // go round several times faster than the surface they sit in.
+  float subAmt = smoothstep(0.52, 0.92, wedge);
+  if (subAmt > 0.02){
+    float sub = 0.0;
+    for (int i = 0; i < 3; i++){
+      float a  = spin * 2.1 + float(i) * (PI * 2.0 / 3.0);
+      vec2  sc = vec2(cos(a), sin(a)) * rr * 0.60;
+      float sd = length(d - sc) / max(rr * 0.36, 20.0);
+      sub = max(sub, exp(-sd * sd));
+    }
+    core = max(core, sub * subAmt * smoothstep(0.95, 0.30, f));
+  }
+
   float reach = smoothstep(0.0, 0.30, f + (uTorn - 1.0) * 1.6 + 0.30);
-
   // Near the surface the condensation is lost inside the debris cloud, which is
   // a different medium and gets its own colour.
   float veil = smoothstep(0.0, 0.16, f);
-  return smoothstep(rf, rf * 0.45, r) * reach * veil * uTorn;
+  return clamp(core, 0.0, 1.0) * reach * veil * uTorn;
 }
 
 float virgaForm(vec3 p, float h){
@@ -1051,7 +1230,9 @@ vec4 sampleMedium(vec3 p, bool cheap, float lod, out float precipF){
 
   float water = 0.0, dust = 0.0, ash = 0.0;
 
-  if (hf > -0.02 && hf < 1.02) water = layerForm(p, h, hf);
+  // Wider than it was: a cell in the population can be half again as deep as
+  // the nominal deck, which is the point of giving each cloud its own depth.
+  if (hf > -0.02 && hf < 1.60) water = layerForm(p, h, hf);
   float ice = 0.0, anvTop = 0.0;
   float storm = stormForm(p, h, ice, anvTop);
   water = max(water, storm);
@@ -1095,10 +1276,19 @@ vec4 sampleMedium(vec3 p, bool cheap, float lod, out float precipF){
   float roll;
   dust = haboobForm(p, h, roll);
   dust = max(dust, ring);
-  if (uTorn > 0.0){                                   // debris cloud at the surface
-    float r = length(p.xz - uStorm);
-    float deb = smoothstep(700.0, 0.0, r) * smoothstep(430.0, 0.0, h);     // ground contact
-    deb += smoothstep(250.0, 0.0, r) * smoothstep(1100.0, 0.0, h) * 0.85;  // lofted sheath
+  if (uTorn > 0.0){
+    // The debris cloud, under the funnel rather than under the mesocyclone's
+    // geometric centre — the funnel wanders, and a dust cloud that stays put
+    // while it does gives the whole thing away. It rotates too, faster than the
+    // funnel above it, because what is being lifted has been picked up at the
+    // surface where the inflow is fastest.
+    vec2  dd = p.xz - funnelAxis(0.0);
+    float r  = length(dd);
+    float td = atan(dd.y + 1e-6, dd.x + 1e-6) - uTime * 0.78;
+    float swirl = 0.55 + 0.75 * fbm2c(vec2(cos(td) * 3.0 + h * 0.0019,
+                                           sin(td) * 3.0 - uTime * 0.42));
+    float deb = smoothstep(780.0, 0.0, r) * smoothstep(470.0, 0.0, h) * swirl;
+    deb += smoothstep(260.0, 0.0, r) * smoothstep(1150.0, 0.0, h) * 0.85;
     dust = max(dust, clamp(deb, 0.0, 1.0) * uTorn * 1.1);
   }
   ash = ashForm(p, h);
@@ -1111,12 +1301,12 @@ vec4 sampleMedium(vec3 p, bool cheap, float lod, out float precipF){
   // Shape volume, advected with the wind so detail travels with the air.
   vec3 wp = p;
   if (uSuper > 0.0){
-    // Mesocyclone: spin the noise lookup about the updraft axis, fastest near
-    // the core, so the wall cloud and the flanking bands visibly rotate.
+    // Carry the noise round with the mesocyclone, on the same Rankine profile
+    // the rest of the storm turns on: fast and rigid inside the core, falling
+    // off as 1/r² outside it. The shear between those is what winds the detail
+    // into a spiral instead of turning it as a rigid disc.
     vec2  dm = wp.xz - uStorm;
-    float rm = length(dm);
-    float om = 0.11 * exp(-rm / 5200.0) * uSuper;
-    wp.xz = uStorm + rot2(dm, uTime * om);
+    wp.xz = uStorm + rot2(dm, mesoSpin(length(dm)));
   }
   vec3 sp = (wp - vec3(uWind.x, 0.0, uWind.y) * uTime) * 0.00019;
   float shapeMip = mipFor(lod, SHAPE_TEXEL);
@@ -1537,6 +1727,11 @@ vec4 marchClouds(vec3 ro, vec3 rd, float tMax, float jitter, out float meanT){
       float dh = abs(hgt(ro + rd * t) - uFogLvl);
       if (dh < 620.0) dt = min(dt, max(16.0, t * 0.004) + dh * 0.20);
     }
+    // Finite and sane, unconditionally. The mip level every noise lookup uses
+    // is derived from this, and textureLod given a NaN or a wild level reads
+    // an arbitrary one — which arrives on screen as rectangular blocks of a
+    // coarse mip punched through the cloud.
+    dt = clamp(dt, 4.0, 20000.0);
     gVertLod = dt * max(abs(rd.y), 0.06);
     vec3  p  = ro + rd * (t + dt * jitter);
     float pf;
@@ -1968,7 +2163,7 @@ void main(){
   if (uVirga <= 0.0 && uTorn <= 0.0 && uHaboob <= 0.0 && uMicro <= 0.0 && uAsh <= 0.0 &&
       uLent <= 0.0 && uFogD <= 0.0 && uPrecip <= 0.0 && uSuper <= 0.0)
     gLoH = max(0.0, uBase - 300.0);
-  gHiH = uTop;
+  gHiH = uBase + (uTop - uBase) * 1.60;   // room for the deepest cells
   if (uSuper > 0.0) gHiH = max(gHiH, uEL + 7800.0);   // overshoot + its fade
   if (uFogD  > 0.0) gHiH = max(gHiH, uFogLvl + 90.0);
   if (uAltoc  > 0.0) gHiH = max(gHiH, 5350.0);
@@ -2022,6 +2217,13 @@ void main(){
   // away, and a sunlit cloud edge carries fifty times the radiance of the
   // ground beside it: crush that to 1.0 before the bloom sees it and the lens
   // veil is built from a flat white blob instead of from the highlight.
+  // NaN is not a colour, and it is not something the passes downstream can
+  // recover from: the temporal blend of anything with NaN is NaN, so a single
+  // undefined sample lodges in the history buffer and stays there for the rest
+  // of the session — the neighbourhood clip cannot remove what it cannot
+  // compare against. min() will not catch it either. So it is caught here,
+  // where there is still a frame to throw away rather than a permanent hole.
+  if (any(isnan(col)) || any(isinf(col))) col = vec3(0.0);
   col = max(col, 0.0);
   col = min(col, 128.0);                    // clamp only the fireflies, not the sun
 
@@ -2166,6 +2368,9 @@ void main(){
   }
 
   vec4 h = texture(uHist, clamp(huv, vec2(0.0), vec2(1.0)));
+  // And again on the way back in, so a buffer that somehow already holds one
+  // washes itself clean on the next frame rather than keeping the hole.
+  if (any(isnan(h)) || any(isinf(h))) h = vec4(c.rgb, c.a);
   vec3 hc = clamp(h.rgb, lo, hi);
   float bl = mix(1.0, uBlend, valid);
 
@@ -3042,7 +3247,15 @@ function updateTurrets(t) {
     const T = TURRETS[i];
     const cyc = (t * T.sp + T.ph) % 1;
     const amp = Math.sin(cyc * Math.PI);          // born, peaks, dies back
-    const ang = T.ang + t * 0.014;
+    // Turrets orbit the updraft on the same Rankine profile the shader turns
+    // the rest of the storm on: solid body inside the core, angular momentum
+    // conserved outside it. A bubble sitting near the axis therefore laps one
+    // out on the flank, which is what stops the cluster reading as a rigid
+    // pinwheel.
+    const orb = T.spread * T.hFrac * core;
+    const rc = Math.max(core * 0.40, 200);
+    const omega = orb < rc ? 34 / rc : 34 * rc / Math.max(orb * orb, 1);
+    const ang = T.ang + t * omega * A.super;
     const d   = T.spread * T.hFrac * core;
     turretBuf[i * 4]     = Math.cos(ang) * d;
     turretBuf[i * 4 + 1] = Math.sin(ang) * d;
