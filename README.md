@@ -28,19 +28,28 @@ Touch devices get an on-screen pad; drag still looks around.
 
 ## What it simulates
 
-Twelve scenarios set up an environment; the phenomena then follow from it.
+Thirteen scenarios set up an environment; the phenomena then follow from it.
 
 - **Tier A** — cumuliform and stratiform decks, altocumulus billow rows, rain shafts
   and the scud under them, virga, radiation fog, crepuscular rays, the 42° rainbow with
-  its secondary and Alexander's dark band, 22° halo with parhelia, lenticular stacks,
-  cirrus veil.
+  its secondary and Alexander's dark band, lenticular stacks, cirrus veil, and the ice
+  halo complex — the 22° and 46° rings, sun dogs that move outward as the sun rises and
+  are gone by 61°, the colourless parhelic circle right round the sky at the sun's own
+  altitude, and the circumzenithal arc, which comes from a 90° prism rather than a 60°
+  one and is the purest colour the sky makes.
 - **Tier B** — supercells with sheared anvils, mammatus on the anvil underside,
   overshooting tops, a forward-flank precipitation core with the inflow notch open
   beside it, tornadic funnels
   with debris, microburst outflows, haboob density currents, volcanic ash plumes lit
   from inside by their own lightning, Fujiwhara-style twin circulations.
-- **Tier C** — red sprites, noctilucent cloud, ball lightning, fallstreak holes,
-  glories, light pillars.
+- **Tier C** — aurora, where the air itself is emitting rather than being lit: green
+  from atomic oxygen at 100 km, red only on top because that state lives two minutes and
+  below 200 km a collision beats it to it, a violet nitrogen fringe along the bottom
+  edge, and curtains that are coherent in plan view and finely rayed along their length
+  because the rays are the field lines. Nacreous cloud at 22 km, still in daylight an
+  hour after the ground is dark, iridescent because its droplets are uniform enough for
+  their diffraction orders not to cancel. Red sprites, noctilucent cloud, ball lightning,
+  fallstreak holes with the ice plume that fell out of them, glories, light pillars.
 
 ## The live sky
 

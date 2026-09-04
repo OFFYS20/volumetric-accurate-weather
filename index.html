@@ -449,7 +449,7 @@ uniform float uShear, uHaze, uExposure, uVirga, uFogD, uFogTop, uFogLvl;
 uniform float uPrecip, uAltoc, uBow;
 uniform vec2  uStorm;
 uniform float uSuper, uTorn, uMicro, uHaboob, uAsh, uFuji, uFront;
-uniform float uHalo, uGlory, uPillar, uNLC, uSprite, uCavum, uLent, uNacre;
+uniform float uHalo, uGlory, uPillar, uNLC, uSprite, uCavum, uLent, uNacre, uAurora;
 uniform float uFlash;
 uniform vec3  uFlashP;
 uniform vec4  uBall;
@@ -1033,6 +1033,29 @@ float virgaForm(vec3 p, float h){
   return smoothstep(0.52, 0.86, m) * (1.0 - f) * (1.0 - f) * uVirga * 0.7;
 }
 
+/* The fall streak in a fallstreak hole. The hole is not the phenomenon — it is
+   the evidence. A deck of supercooled droplets is freezing all at once around
+   a seed, the new ice crystals grow at the expense of the droplets around them
+   because ice has the lower vapour pressure, and then they are heavy enough to
+   fall out. So the deck loses its cloud over a circle, and the cloud that used
+   to be there is hanging below the middle of it as a plume of ice. Punching the
+   hole without drawing what fell out of it is drawing the wrong half. */
+float cavumStreak(vec3 p, float h){
+  if (uCavum <= 0.0) return 0.0;
+  float top = uBase - 40.0;
+  float f = (top - h) / 2600.0;                       // 0 at the deck, 1 at the bottom
+  if (f <= 0.0 || f >= 1.0) return 0.0;
+  // Crystals fall slowly and are carried downwind as they go, so the plume
+  // trails and spreads.
+  vec2  c = uStorm + vec2(3000.0, -2000.0) + gWindDir * f * 1500.0;
+  float r = length(p.xz - c);
+  float rad = (420.0 + 1500.0 * f) * uCavum;
+  float body = smoothstep(rad, rad * 0.25, r);
+  float wisp = 0.40 + 0.85 * fbm2c(vec2(r * 0.0016, h * 0.0022 - uTime * 0.05));
+  // Thickest just under the deck, thinning to nothing as the crystals sublime.
+  return clamp(body * wisp * (1.0 - f) * smoothstep(0.0, 0.10, f), 0.0, 1.0) * uCavum * 0.55;
+}
+
 /* Radiation fog. After sunset the ground radiates its heat to space, the air
    in contact with it cools to its dew point, and the cold air — being denser —
    runs downhill and ponds. So the top of a fog bank is a LEVEL surface, not a
@@ -1239,6 +1262,7 @@ vec4 sampleMedium(vec3 p, bool cheap, float lod, out float precipF){
   float lent = lentForm(p);
   water = max(water, lent);
   water = max(water, virgaForm(p, h));
+  water = max(water, cavumStreak(p, h));
   float fogD = fogForm(p, h, lod);
   water = max(water, fogD);
   water = max(water, altoForm(p, h));
@@ -1991,6 +2015,12 @@ vec3 shadeTerrain(vec3 p, vec3 rd, float t){
   return col;
 }
 
+vec3 spectrum(float x){                     // 0 = violet, 1 = red
+  return clamp(vec3(smoothstep(0.40, 0.88, x),
+                    smoothstep(0.08, 0.46, x) * smoothstep(1.04, 0.60, x),
+                    smoothstep(0.50, 0.04, x)), 0.0, 1.0);
+}
+
 /* ─────────────────────────── angular optics ─────────────────────────── */
 vec3 angularOptics(vec3 rd, float cloudTr, float skyMask){
   vec3 c = vec3(0.0);
@@ -2007,14 +2037,59 @@ vec3 angularOptics(vec3 rd, float cloudTr, float skyMask){
     // 46° ring, always fainter
     float d2 = th - 0.7976;
     c += vec3(0.80, 0.86, 1.0) * step(0.0, d2) * exp(-d2 / 0.028) * uHalo * 0.10;
-    // parhelia — energy that oriented plates move out of the ring
-    for (int s = 0; s < 2; s++){
-      float sgn = s == 0 ? 1.0 : -1.0;
-      float sep = 0.3812 / max(sqrt(max(1.0 - uSun.y * uSun.y, 0.05)), 0.35);
-      vec2  hz  = rot2(vec2(uSun.x, uSun.z), sgn * sep);
-      vec3  dg  = normalize(vec3(hz.x, uSun.y, hz.y));
-      float a   = acos(clamp(dot(rd, dg), -1.0, 1.0));
-      c += vec3(1.0, 0.72, 0.40) * exp(-a * a / 0.00042) * uHalo * 0.55;
+    // Sun dogs. Plate crystals drifting with their faces horizontal refract
+    // through the same 60° prism as the ring, but only in the horizontal plane
+    // — so the energy piles up at the sun's own altitude. They sit ON the 22°
+    // ring only when the sun is on the horizon: as it rises, the light has to
+    // take a slanted path through the prism, the effective refracting angle
+    // grows, and the dogs move outward. By 61° they have moved out past where
+    // plates can still produce them and the display simply ends.
+    float sunE = asin(clamp(uSun.y, -1.0, 1.0));
+    float dogSep = 0.3812 / max(cos(sunE * 1.08), 0.30);
+    float dogFade = smoothstep(1.13, 0.96, sunE);        // gone by about 61°
+    if (dogFade > 0.002){
+      for (int s = 0; s < 2; s++){
+        float sgn = s == 0 ? 1.0 : -1.0;
+        // Separated in azimuth by whatever subtends dogSep at this altitude.
+        float az = dogSep / max(cos(sunE), 0.16);
+        vec2  hz = rot2(vec2(uSun.x, uSun.z), sgn * az);
+        vec3  dg = normalize(vec3(hz.x, uSun.y, hz.y));
+        float a  = acos(clamp(dot(rd, dg), -1.0, 1.0));
+        // Red on the side facing the sun, and a white tail trailing away from
+        // it: the tail is light that missed minimum deviation.
+        float towardSun = dot(normalize(rd - dg * dot(rd, dg) + 1e-6), normalize(uSun - dg * dot(uSun, dg) + 1e-6));
+        vec3 tint = mix(vec3(0.86, 0.90, 1.0), vec3(1.0, 0.62, 0.30), clamp(towardSun, 0.0, 1.0));
+        c += tint * exp(-a * a / 0.00042) * uHalo * dogFade * 0.55;
+        c += vec3(0.92, 0.94, 1.0) * exp(-a * a / 0.0032)
+           * smoothstep(0.15, -0.55, towardSun) * uHalo * dogFade * 0.10;
+      }
+    }
+
+    // The parhelic circle: a white band right round the sky at the sun's own
+    // altitude, from light glancing off the vertical side faces of those same
+    // plates. Reflection, not refraction, so it has no colour at all.
+    float pc = exp(-pow((rd.y - uSun.y) / 0.016, 2.0));
+    c += vec3(0.90, 0.93, 1.0) * pc * uHalo * 0.075 * smoothstep(-0.02, 0.10, uSun.y);
+
+    // The circumzenithal arc — the one people photograph and call an upside-down
+    // rainbow, because that is exactly what it looks like. Light enters the
+    // horizontal TOP face of a plate and leaves through a side face, a 90°
+    // prism, which disperses far more cleanly than the 60° one: this is the
+    // purest colour the sky produces. It is centred on the zenith, sits 46°
+    // above the sun, and cannot exist at all once the sun is above 32° — the
+    // ray can no longer get through the two faces.
+    float cza = smoothstep(0.60, 0.50, sunE) * smoothstep(0.0, 0.12, uSun.y);
+    if (cza > 0.002){
+      float zd  = 0.7679 - sunE;                       // zenith distance of the arc
+      float rzd = acos(clamp(rd.y, -1.0, 1.0));
+      float band = (rzd - zd) / 0.024;
+      vec2 rh = normalize(vec2(rd.x, rd.z) + 1e-6), sh = normalize(vec2(uSun.x, uSun.z) + 1e-6);
+      float arc = smoothstep(0.42, 0.95, dot(rh, sh));
+      // Red on the sunward edge, which is the LOWER one — the arc is above the
+      // sun and curves round the zenith, so increasing zenith distance means
+      // moving back down toward it. Violet lies on the zenith side.
+      vec3 tint = spectrum(clamp(0.5 + band * 0.55, 0.0, 1.0));
+      c += tint * exp(-band * band) * arc * cza * uHalo * 0.42;
     }
   }
 
@@ -2046,11 +2121,6 @@ vec3 angularOptics(vec3 rd, float cloudTr, float skyMask){
    emerges at 51° with the order reversed, and between the two bows almost no
    light comes back at all — Alexander's dark band. All three come out of the
    same geometry, so all three are here. */
-vec3 spectrum(float x){                     // 0 = violet, 1 = red
-  return clamp(vec3(smoothstep(0.40, 0.88, x),
-                    smoothstep(0.08, 0.46, x) * smoothstep(1.04, 0.60, x),
-                    smoothstep(0.50, 0.04, x)), 0.0, 1.0);
-}
 vec3 rainbow(vec3 ro, vec3 rd, float tEnd){
   if (uBow <= 0.0 || uSun.y < 0.004) return vec3(0.0);
   float th = acos(clamp(dot(rd, -uSun), -1.0, 1.0));
@@ -2105,6 +2175,114 @@ vec3 sprites(vec3 ro, vec3 rd){
     acc += col * dens * dt * 2.6e-5;
   }
   return acc * uSprite;
+}
+
+/* Aurora.
+
+   Not a cloud and not lit by anything: it is the air itself emitting, where
+   electrons guided down the magnetic field collide with it. That single fact
+   sets everything about how it looks.
+
+   It emits at discrete wavelengths, and which ones depends on height, because
+   the excited states have different lifetimes and the air has different
+   densities. The 557.7 nm green line of atomic oxygen dominates from about 100
+   to 150 km. Its 630 nm red line comes from a state that lives two minutes, so
+   below 200 km a collision knocks it out before it can radiate — which is why
+   only the top of a strong display is red. Ionised nitrogen puts a violet
+   fringe along the very bottom edge, where the hardest electrons reach.
+
+   The lower edge is sharp because that is simply where the electrons stop. The
+   top is diffuse because it is set by how thin the air is, not by a boundary.
+   And the structure is a curtain: coherent and meandering seen from above,
+   finely rayed along its length, because the rays ARE the field lines. The
+   level set of a smooth field is a set of continuous meandering lines, which
+   is what a curtain is in plan view — the same construction the valley network
+   uses, for the same reason. */
+vec3 aurora(vec3 ro, vec3 rd){
+  if (uAurora <= 0.0 || rd.y < -0.04) return vec3(0.0);
+  float night = 1.0 - smoothstep(-0.14, 0.03, uSun.y);
+  if (night < 0.02) return vec3(0.0);
+  float t0, t1;
+  if (!bandRange(ro, rd, 95000.0, 255000.0, 1600000.0, t0, t1)) return vec3(0.0);
+  t1 = min(t1, t0 + 800000.0);
+
+  vec3 acc = vec3(0.0);
+  const int N = 26;
+  float dt = (t1 - t0) / float(N);
+  for (int i = 0; i < N; i++){
+    vec3  p = ro + rd * (t0 + dt * (float(i) + gJitter));
+    float h = hgt(p);
+    if (h < 95000.0 || h > 255000.0) continue;
+    // Curtains are a few kilometres thick and tens of kilometres apart, so the
+    // sheet coordinate has to run at that scale — at the scale of the band's
+    // own height the whole visible sky fits inside one curtain, and what you
+    // get is a wash rather than a display.
+    vec2  q = p.xz * 0.000018;
+    float sheet = abs(fbm2c(q + vec2(uTime * 0.0016, 0.0)) - 0.5);
+    // A Gaussian across the curtain rather than a smoothstep with an edge on
+    // it: the march crosses a two-kilometre sheet in one or two steps, and
+    // whether a step lands inside a hard-edged one is close to a coin toss —
+    // which arrives as speckle that no amount of temporal averaging clears.
+    float body  = exp(-sheet * sheet / 0.0011);
+    // The oval is a band over the pole, not a dome. From under its edge the
+    // display stands across one part of the sky and the rest of it stays dark,
+    // which is also what stops it drowning everything else in the scene.
+    body *= smoothstep(-220000.0, 60000.0, p.z);
+    if (body <= 0.003) continue;
+    // Rays along the curtain. They drift, and they are much finer than the
+    // curtain is wide, which is what makes a display look like it is combed.
+    float rays = 0.22 + 1.05 * fbm2c(q * 11.0 - vec2(0.0, uTime * 0.011));
+    float vp = smoothstep(95000.0, 109000.0, h) * exp(-max(h - 120000.0, 0.0) / 46000.0);
+    vec3  emis = mix(vec3(0.20, 1.00, 0.46), vec3(1.00, 0.17, 0.24),
+                     smoothstep(150000.0, 235000.0, h));
+    emis += vec3(0.44, 0.30, 1.00) * smoothstep(114000.0, 97000.0, h) * 0.6;
+    acc += emis * body * rays * vp * dt;
+  }
+  return acc * uAurora * night * 1.35e-6;
+}
+
+/* Nacreous cloud — polar stratospheric, 20-25 km up, and the most colourful
+   thing in the sky. Two facts make it: it is far above the weather, so it is
+   still in full sunlight for an hour after the ground has gone dark; and it
+   forms at −80 °C from droplets of remarkably uniform size, so their
+   diffraction orders do not average each other out the way a normal cloud's do.
+   Uniform particles plus a point source is a diffraction grating, and the
+   result is those pastel bands of pink and green that shift as you move. */
+vec3 nacreous(vec3 ro, vec3 rd){
+  if (uNacre <= 0.0 || rd.y < -0.02) return vec3(0.0);
+  // The window is geometric: the sun below the observer's horizon but still
+  // above the horizon of a point 22 km up, which is about four degrees lower.
+  float win = smoothstep(0.035, -0.01, uSun.y) * (1.0 - smoothstep(-0.062, -0.125, uSun.y));
+  if (win <= 0.002) return vec3(0.0);
+  float th;
+  if (!shellHit(ro, rd, 22000.0, th)) return vec3(0.0);
+  vec3  p = ro + rd * th;
+  vec2  q = p.xz * 0.000021 + vec2(uTime * 0.0009, 0.0);
+
+  // These are lee-wave clouds: smooth lens-shaped sheets stacked in the flow
+  // over a mountain range, not convective lumps, so the field is banded across
+  // the wind rather than cellular.
+  vec2  e = vec2(dot(q, gWindDir) * 0.42, dot(q, vec2(-gWindDir.y, gWindDir.x)));
+  // Band-limited the same way the noctilucent sheet is: a near-flat layer this
+  // far up compresses toward the horizon until its texture is finer than a
+  // pixel, and what that produces is moiré rings rather than cloud.
+  float nfoot = 42.0 / max(rd.y * rd.y, 0.004);
+  float coarse = mix(0.5, fbm2 (e * 1.5), clamp(1.0 - nfoot / 9000.0, 0.0, 1.0));
+  float fine   = mix(0.5, fbm2c(e * 9.0), clamp(1.0 - nfoot / 1400.0, 0.0, 1.0));
+  float body = smoothstep(0.44, 0.78, coarse) * (0.45 + 0.75 * fine);
+  body *= smoothstep(0.0, 0.07, rd.y) * exp(-max(rd.y - 0.42, 0.0) * 2.4);
+  if (body <= 0.002) return vec3(0.0);
+
+  // Iridescence. The order of the diffraction depends on the scattering angle
+  // and on how much cloud the light came through, so the bands follow the
+  // cloud's own thickness — which is why the colours lie along its structure
+  // instead of being painted across the sky.
+  float ang = acos(clamp(dot(rd, uSun), -1.0, 1.0));
+  float ord = ang * (13.0 + 16.0 * fine) + coarse * 5.5;
+  vec3  irid = 0.42 + 0.58 * cos(vec3(0.0, 2.094, 4.189) + ord);
+  // Lit through a long, reddened path, the way anything is at sunset.
+  vec3 lit = SOLAR * sunTrans(22000.0, uSun.y) * 0.028;
+  return irid * lit * body * win * uNacre;
 }
 
 vec3 noctilucent(vec3 ro, vec3 rd){
@@ -2167,6 +2345,7 @@ void main(){
   if (uSuper > 0.0) gHiH = max(gHiH, uEL + 7800.0);   // overshoot + its fade
   if (uFogD  > 0.0) gHiH = max(gHiH, uFogLvl + 90.0);
   if (uAltoc  > 0.0) gHiH = max(gHiH, 5350.0);
+  if (uCavum  > 0.0) gLoH = 0.0;        // the fall streak hangs below the deck
   if (uCirrus > 0.0) gHiH = max(gHiH, 11000.0);
   if (uAsh   > 0.0) gHiH = max(gHiH, 16500.0);
 
@@ -2188,6 +2367,8 @@ void main(){
   } else {
     col = skyColour(rd);
     col += sprites(ro, rd);
+    col += aurora(ro, rd);
+    col += nacreous(ro, rd);
     col += noctilucent(ro, rd);
   }
   col += ballGlow(ro, rd);
@@ -2907,7 +3088,7 @@ const S = {
   terrain: 850, ground: 0.15, snow: 2400, sea: 0,
   virga: 0, fog: 0, altoc: 0, bow: 1, halo: 0, glory: 0, pillar: 0, lent: 0, cavum: 0,
   super: 0, torn: 0, micro: 0, haboob: 0, ash: 0, fuji: 0,
-  sprite: 0, nlc: 0, ball: 0,
+  sprite: 0, nlc: 0, ball: 0, aurora: 0, nacre: 0,
   drift: 1, chase: 0, ltg: 1, sound: 0, scope: 1,
   live: 0, tod: 8.6, rate: 150,
   quality: 1
@@ -2915,7 +3096,7 @@ const S = {
 // Phenomena ease in and out instead of popping, which also gives the
 // accumulation buffer something to converge toward.
 const EASED = ["virga","fog","altoc","bow","halo","glory","pillar","lent","cavum","super","torn",
-               "micro","haboob","ash","fuji","sprite","nlc","ball","stratus","cirrus"];
+               "micro","haboob","ash","fuji","sprite","nlc","ball","aurora","nacre","stratus","cirrus"];
 const A = {}; EASED.forEach(k => A[k] = S[k]);
 
 // Step counts raised across the board. A supercell is now forty kilometres of
@@ -3643,14 +3824,14 @@ const SCENARIOS = [
     desc:"A shallow convective field on a summer afternoon. Move the dew point and watch every base move together.",
     set:{ dewDep:11, cape:520, coverage:0.44, stratus:0, cirrus:0, windSpd:6, windDir:215, shear:2,
           sunElev:44, sunAz:130, haze:0.5, terrain:800, ground:0.15, snow:2600, sea:-15,
-          live:0,altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+          live:0,altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0,aurora:0,nacre:0 },
     storm:[6000,9000], cam:[0,2950,-9000], look:[0,1650,4000] },
 
   { id:"super", hue:"var(--b)", name:"Supercell", tag:"Tier B · rotating storm", g:G.super,
     desc:"3200 J/kg of CAPE under 25 m/s of shear, from 30 km out. Broad glaciated canopy, rough overshooting top, wide rain-filled base.",
     set:{ dewDep:8, cape:3200, coverage:0.30, stratus:0, cirrus:0, windSpd:15, windDir:200, shear:7,
           sunElev:17, sunAz:150, haze:0.33, terrain:300, ground:0.35, snow:6000, sea:-400,
-          live:0,altoc:0,bow:1,virga:1,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:1,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+          live:0,altoc:0,bow:1,virga:1,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:1,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0,aurora:0,nacre:0 },
     // Thirty kilometres out and low, which is where you would stand to look at
     // one. From anvil height the tower is foreshortened into a stub; from down
     // here the column rises through most of the frame with the canopy spreading
@@ -3661,7 +3842,7 @@ const SCENARIOS = [
     desc:"A low condensation level lets the funnel reach the ground. Raise the dew-point depression and it lifts.",
     set:{ dewDep:6, cape:3600, coverage:0.22, stratus:0, cirrus:0, windSpd:14, windDir:200, shear:8,
           sunElev:17, sunAz:255, haze:0.5, exposure:1.35, terrain:140, ground:0.4, snow:6000, sea:-400,
-          live:0,altoc:0,bow:1,virga:1,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:1,torn:1,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+          live:0,altoc:0,bow:1,virga:1,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:1,torn:1,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0,aurora:0,nacre:0 },
     // Seven kilometres out, in the inflow notch on the storm's upwind flank.
     // The updraft is a dozen kilometres across now, so from the old three the
     // camera was directly underneath it in the dark; from much further the
@@ -3672,64 +3853,74 @@ const SCENARIOS = [
     desc:"A gravity current running out ahead of a dying storm, lofting a wall of dust with a rolling head.",
     set:{ dewDep:24, cape:900, coverage:0.14, stratus:0, cirrus:0, windSpd:17, windDir:180, shear:2,
           sunElev:11, sunAz:250, haze:0.6, terrain:180, ground:0.95, snow:9000, sea:-400,
-          live:0,altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:1,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+          live:0,altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:1,ash:0,fuji:0,sprite:0,nlc:0,ball:0,aurora:0,nacre:0 },
     storm:[0,14000], front:-1400, cam:[0,340,3000], look:[0,1900,-9000] },
 
   { id:"ash", hue:"var(--b)", name:"Ash Column", tag:"Tier B · plume + discharge", g:G.ash,
     desc:"A buoyant plume spreading into an umbrella at its neutral buoyancy level, lit from inside by its own lightning.",
     set:{ dewDep:14, cape:400, coverage:0.18, stratus:0, cirrus:0, windSpd:9, windDir:210, shear:3,
           sunElev:23, sunAz:265, haze:0.55, terrain:520, ground:0.35, snow:2400, sea:-400,
-          live:0,altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:1,fuji:0,sprite:0,nlc:0,ball:0 },
+          live:0,altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:1,fuji:0,sprite:0,nlc:0,ball:0,aurora:0,nacre:0 },
     storm:[0,0], cam:[-9000,1500,-9000], look:[0,6500,0] },
 
   { id:"fog", hue:"var(--a)", name:"Sea of Fog", tag:"Tier A · radiation fog", g:G.fog,
     desc:"Cold air draining into the valleys overnight, with the sun just clearing the ridge. Look away from it for the glory.",
     set:{ dewDep:14, cape:150, coverage:0.22, stratus:0.6, cirrus:0, windSpd:2, windDir:90, shear:1,
           sunElev:5, sunAz:95, haze:0.45, terrain:1200, ground:0.1, snow:2800, sea:-400,
-          live:0,altoc:0,bow:1,virga:0,fog:1,halo:0,glory:1,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+          live:0,altoc:0,bow:1,virga:0,fog:1,halo:0,glory:1,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0,aurora:0,nacre:0 },
     storm:[6000,9000], cam:[-2400,1450,-1200], look:[4000,300,3500] },
 
   { id:"ice", hue:"var(--a)", name:"Ice Optics", tag:"Tier A/C · halo, dogs, pillars", g:G.ice,
     desc:"A cirrostratus veil of hexagonal prisms. The 22° ring, its parhelia and a pillar from the oriented plates.",
     set:{ dewDep:16, cape:80, coverage:0.30, stratus:0.85, cirrus:1, windSpd:11, windDir:250, shear:2,
           sunElev:7, sunAz:0, haze:0.4, terrain:380, ground:0.0, snow:500, sea:-400,
-          live:0,altoc:0,bow:1,virga:0,fog:0,halo:1,glory:0,pillar:1,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
-    storm:[6000,9000], cam:[0,950,-4000], look:[0,1500,4000] },
+          live:0,altoc:0,bow:1,virga:0,fog:0,halo:1,glory:0,pillar:1,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0,aurora:0,nacre:0 },
+    // Looking up. The circumzenithal arc sits fifty degrees above the horizon —
+    // halos are something you see by tilting your head back, and framing this
+    // scenario at eye level cropped out the best of it.
+    storm:[6000,9000], cam:[0,950,-4000], look:[0,5600,4000] },
 
-  { id:"tle", hue:"var(--c)", name:"Night Sky", tag:"Tier C · sprites, NLC", g:G.tle,
-    desc:"Deep twilight. A distant mesoscale system throwing sprites into the mesosphere, with noctilucent cloud above it.",
+  { id:"tle", hue:"var(--c)", name:"Night Sky", tag:"Tier C · aurora, sprites, NLC", g:G.tle,
+    desc:"Deep twilight, and three things that only happen up there. Aurora, where the air itself is emitting — green from oxygen at 100 km, red on top where the state lives long enough to radiate. A distant mesoscale system throwing sprites into the mesosphere. Noctilucent cloud at 80 km, still in sunlight hours after the ground went dark.",
     set:{ dewDep:9, cape:2600, coverage:0.30, stratus:0, cirrus:0, windSpd:10, windDir:200, shear:5,
           sunElev:-9, sunAz:320, haze:0.3, terrain:600, ground:0.2, snow:2600, sea:-400,
-          live:0,altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:1,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:1,nlc:1,ball:0 },
+          live:0,altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:1,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:1,nlc:1,ball:0,aurora:1,nacre:0 },
     storm:[30000,26000], cam:[-6000,2000,-10000], look:[30000,33000,26000] },
+
+  { id:"nacre", hue:"var(--c)", name:"Polar Twilight", tag:"Tier C · nacreous cloud", g:G.ice,
+    desc:"Winter, high latitude, the sun a couple of degrees below the horizon. Twenty-two kilometres up it is still broad daylight, and at −80 °C the stratosphere grows clouds from droplets so uniform in size that their diffraction orders stop cancelling — which is why these are the most colourful clouds there are. An hour after sunset and an hour before dawn; never in between.",
+    set:{ dewDep:13, cape:120, coverage:0.16, stratus:0.2, cirrus:0.25, windSpd:16, windDir:250, shear:5,
+          sunElev:-2.4, sunAz:300, haze:0.20, exposure:1.5, terrain:1500, ground:0.0, snow:900, sea:-400,
+          live:0,altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0,aurora:0,nacre:1 },
+    storm:[6000,9000], cam:[-2000,1300,-6000], look:[2000,7000,4000] },
 
   { id:"live", hue:"var(--b)", name:"Live Sky", tag:"a day, integrated forward", g:G.cumulus,
     desc:"Nothing here is set. It opens on an empty sky, at whatever hour of the morning this particular air mass gives one — a moist calm night holds fog until eight, a breezy one puts up stratus instead, a dry one is clear from first light. Then the ground warms, the mixed layer grows, and when it reaches its condensation level the first cumulus appear. The ground warms, the mixed layer grows, and when it reaches its condensation level the first cumulus appear. Whether they stay humilis or go up as a storm depends on the moisture and the cap the air mass is carrying. Then the storm eats its own instability, the anvil outlives it as cirrus, and by dusk the sky is empty again. Press L anywhere to switch it on.",
     set:{ dewDep:9, cape:0, coverage:0, stratus:0, cirrus:0, windSpd:4, windDir:215, shear:3,
           sunElev:6, sunAz:75, haze:0.42, exposure:1.0, terrain:900, ground:0.18, snow:3200, sea:-400,
           live:1, tod:6.0, rate:150,
-          altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+          altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0,aurora:0,nacre:0 },
     storm:[14000,16000], cam:[-1600,2250,-9500], look:[2600,3100,3000] },
 
   { id:"rain", hue:"var(--a)", name:"Rainband", tag:"Tier A · shafts & the bow", g:G.rain,
     desc:"A deep, well-covered deck letting go. Curtains lean downwind as they fall, scud hangs under the base, and with the sun low behind you the 42° bow stands on the rain.",
     set:{ dewDep:17, cape:2600, coverage:0.72, stratus:0.12, cirrus:0, windSpd:11, windDir:272, shear:4,
           sunElev:14, sunAz:272, haze:0.22, exposure:1.7, terrain:620, ground:0.22, snow:3600, sea:-400,
-          live:0,altoc:1,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+          live:0,altoc:1,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0,aurora:0,nacre:0 },
     storm:[6000,9000], cam:[-15000,1780,1400], look:[9000,420,-600] },
 
   { id:"dusk", hue:"var(--a)", name:"Valley Dusk", tag:"Tier A · fog forming", g:G.fog,
     desc:"Nothing is switched on here. The ground is radiating, the dew-point depression is 3 K and the wind has dropped below 2 m/s — so fog forms, and ponds level in the valleys while the ridges stay clear. Raise the wind and watch it mix away.",
     set:{ dewDep:3, cape:120, coverage:0.16, stratus:0.15, cirrus:0.35, windSpd:1.4, windDir:140, shear:1,
           sunElev:4.0, sunAz:285, haze:0.30, exposure:1.18, terrain:1050, ground:0.08, snow:3000, sea:-400,
-          live:0,altoc:0,bow:0,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+          live:0,altoc:0,bow:0,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0,aurora:0,nacre:0 },
     storm:[6000,9000], cam:[-10600,700,-1200], look:[2000,170,600] },
 
   { id:"lee", hue:"var(--a)", name:"Lee Wave", tag:"Tier A · lenticular stack", g:G.lee,
     desc:"A standing gravity wave over the ridge. The air moves through at 22 m/s; the cloud does not move at all.",
     set:{ dewDep:13, cape:200, coverage:0.16, stratus:0.2, cirrus:0, windSpd:22, windDir:250, shear:4,
           sunElev:21, sunAz:225, haze:0.45, terrain:1300, ground:0.1, snow:2200, sea:-400,
-          live:0,altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:1,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
+          live:0,altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:1,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0,aurora:0,nacre:0 },
     storm:[6000,9000], cam:[3000,2900,-21000], look:[-11000,4200,-9000] }
 ];
 
@@ -3850,7 +4041,8 @@ const CHIPS = [
   { g:"Tier B · severe forces", h:"--b",
     items:[["super","Supercell"],["torn","Tornado"],["micro","Microburst"],["haboob","Haboob"],["ash","Ash plume"],["fuji","Fujiwhara"]] },
   { g:"Tier C · rare & upper air", h:"--c",
-    items:[["sprite","Red sprites"],["nlc","Noctilucent"],["ball","Ball lightning"],["cavum","Fallstreak hole"],["glory","Glory"],["pillar","Light pillars"]] },
+    items:[["sprite","Red sprites"],["nlc","Noctilucent"],["aurora","Aurora"],["nacre","Nacreous"],
+           ["ball","Ball lightning"],["cavum","Fallstreak hole"],["glory","Glory"],["pillar","Light pillars"]] },
   { g:"The chase", h:"--b",
     items:[["ltg","Lightning"],["drift","Storm motion"],["chase","Chase lock (F)"],["scope","Radar (R)"],["sound","Sound"]] },
   { g:"Live sky", h:"--b",
@@ -4295,6 +4487,8 @@ function setUniforms(b){
   gl.uniform1f(u.uGlory, A.glory);
   gl.uniform1f(u.uPillar, A.pillar);
   gl.uniform1f(u.uNLC, A.nlc);
+  gl.uniform1f(u.uAurora, A.aurora);
+  gl.uniform1f(u.uNacre, A.nacre);
   gl.uniform1f(u.uSprite, A.sprite);
   gl.uniform1f(u.uCavum, A.cavum);
   gl.uniform1f(u.uLent, A.lent);
