@@ -2947,14 +2947,45 @@ document.getElementById("phShot").addEventListener("click", () => { pendingShot 
 document.getElementById("phExit").addEventListener("click", () => setPhoto(false));
 document.getElementById("phClose").addEventListener("click",
   () => document.getElementById("phView").classList.add("hidden"));
-document.getElementById("phDl").addEventListener("click", () => {
-  if (!openShotCur) return;
+/* Handing a viewer a file is mediated when the page is published: a plain
+   download link is inert there, and the host asks before anything is saved.
+   Opened as a local file there is no host, and the ordinary link is all there
+   is — so try the mediated path first and fall back only when there is no
+   platform to mediate. */
+let dlCap = null, dlAsked = false, inViewer = false;
+async function getDownloads(){
+  if (dlAsked) return dlCap;
+  dlAsked = true;
+  inViewer = !!(window.claude && typeof window.claude.use === "function");
+  if (!inViewer) return null;
+  try { dlCap = await window.claude.use("downloads"); } catch (e){ dlCap = null; }
+  return dlCap;
+}
+document.getElementById("phDl").addEventListener("click", async () => {
+  const sh = openShotCur;
+  if (!sh) return;
+  const name = "aeolus-" + fmtStamp() + ".png";
+  const cap = await getDownloads();
+  if (cap){
+    phState("saving…", 0);
+    sh.canvas.toBlob(b => {
+      cap.save({ filename: name, data: b })
+        .then(r => phState(r.status === "saved" ? "saved" : "delivered", 2800))
+        .catch(e => phState(e && e.code === "declined" ? "cancelled" : "save unavailable", 3200));
+    }, "image/png");
+    return;
+  }
+  if (inViewer){ phState("saving is off here — use copy image", 3600); return; }
   const a = document.createElement("a");
-  a.href = openShotCur.url;
-  a.download = "aeolus-" + Date.now() + ".png";
+  a.href = sh.url; a.download = name;
   document.body.appendChild(a); a.click(); a.remove();
-  phState("saved, if the browser allowed it", 3000);
+  phState("saved", 2400);
 });
+function fmtStamp(){
+  const d = new Date(), p = v => (v < 10 ? "0" : "") + v;
+  return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + "-" +
+         p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+}
 document.getElementById("phCopy").addEventListener("click", () => {
   const sh = openShotCur;
   if (!sh) return;
