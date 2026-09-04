@@ -517,12 +517,49 @@ bool bandRange(vec3 ro, vec3 rd, float h0, float h1, float TMAX, out float t0, o
     float h = a * t * t + b * t + c;
     bool wasIn = (ph >= h0 && ph <= h1);
     bool isIn  = (h  >= h0 && h  <= h1);
-    if (!wasIn && isIn && t0 < 0.0) t0 = mix(pt, t, 0.35);
-    if (wasIn && !isIn && t0 >= 0.0 && t1 < 0.0) t1 = t;
+    // Interpolate to where the boundary was actually crossed. Snapping to a
+    // fixed fraction of the step quantises the crossing to the scan's own
+    // spacing, and anything that then takes a single sample between t0 and t1 —
+    // the noctilucent sheet, the sprite column — draws those steps across the
+    // sky as concentric rings centred on the zenith.
+    if (!wasIn && isIn && t0 < 0.0){
+      float tgt = (ph < h0) ? h0 : h1;
+      t0 = mix(pt, t, clamp((tgt - ph) / (h - ph), 0.0, 1.0));
+    }
+    if (wasIn && !isIn && t0 >= 0.0 && t1 < 0.0){
+      float tgt = (h < h0) ? h0 : h1;
+      t1 = mix(pt, t, clamp((tgt - ph) / (h - ph), 0.0, 1.0));
+    }
     ph = h; pt = t;
   }
   if (t0 >= 0.0 && t1 < 0.0) t1 = TMAX;
   return t0 >= 0.0 && t1 > t0;
+}
+
+/* Exact intersection with a shell of constant curvature-corrected height.
+   hgt(ro + rd·t) is a quadratic in t, so this is a root solve rather than a
+   search. The 40-step scan above is fine for a deck kilometres thick, but a
+   sheet 7 km thick seen from 120 km away is thinner than the scan's own step
+   spacing out there — so the scan clears it entirely at some ray elevations and
+   catches it at others, and the rings that draws across the night sky are its
+   step boundaries rather than anything in the atmosphere. */
+bool shellHit(vec3 ro, vec3 rd, float H, out float t){
+  float a = -(rd.x * rd.x + rd.z * rd.z) / (2.0 * R);
+  float b = rd.y - (ro.x * rd.x + ro.z * rd.z) / R;
+  float c = ro.y - (ro.x * ro.x + ro.z * ro.z) / (2.0 * R) - H;
+  t = -1.0;
+  if (abs(a) < 1e-13){
+    if (abs(b) < 1e-13) return false;
+    t = -c / b;
+  } else {
+    float disc = b * b - 4.0 * a * c;
+    if (disc < 0.0) return false;
+    float s = sqrt(disc);
+    float r1 = (-b - s) / (2.0 * a), r2 = (-b + s) / (2.0 * a);
+    float lo = min(r1, r2), hi = max(r1, r2);
+    t = lo > 0.0 ? lo : hi;
+  }
+  return t > 0.0;
 }
 
 /* ─────────────────────────── terrain ─────────────────────────── */
@@ -1417,7 +1454,18 @@ vec4 marchClouds(vec3 ro, vec3 rd, float tMax, float jitter, out float meanT){
   float dSum = 0.0, wSum = 0.0;
   bool  cheap = true;
   int   empty = 0;
-  vec3  sunC = sunColour();
+  // Sunlight at the bottom of the deck and at the top of it. A parcel at 12 km
+  // still sees the sun when the ground under it does not — the terminator for a
+  // point that high sits three and a half degrees below the horizon — and the
+  // whole of alpenglow is that difference: a shadowed base under a lit top, the
+  // top reddened by the enormous path its light took to get there. Lighting
+  // every sample with the irradiance at the CAMERA's altitude throws that away,
+  // and after sunset it lights a 12 km anvil with a sun that has, from where it
+  // stands, not actually set.
+  float topLit = max(gHiH, uBase + 800.0);
+  vec3  sunLo = SOLAR * sunTrans(max(gLoH, 0.0), uSun.y);
+  vec3  sunHi = SOLAR * sunTrans(topLit,        uSun.y);
+  float litSpan = max(topLit - max(gLoH, 0.0), 1.0);
 
   for (int i = 0; i < 320; i++){
     if (i >= uSteps || t > t1 || tr < 0.02) break;
@@ -1455,7 +1503,9 @@ vec4 marchClouds(vec3 ro, vec3 rd, float tMax, float jitter, out float meanT){
     alb   = mix(alb, vec3(0.36, 0.41, 0.51), pf);
     sigma = mix(sigma, 0.0090, pf);
     float sunD  = lightMarch(p, dt);
-    float hf    = clamp((hgt(p) - uBase) / max(uTop - uBase, 1.0), 0.0, 1.0);
+    float ph    = hgt(p);
+    float hf    = clamp((ph - uBase) / max(uTop - uBase, 1.0), 0.0, 1.0);
+    vec3  sunC  = mix(sunLo, sunHi, clamp((ph - max(gLoH, 0.0)) / litSpan, 0.0, 1.0));
 
     // Three energy-attenuated octaves stand in for multiple scattering.
     // Powder darkens edges that are lit from behind — apply it toward the sun,
@@ -1799,12 +1849,20 @@ vec3 noctilucent(vec3 ro, vec3 rd){
   // Visible only in deep twilight: the sheet is lit while the ground is dark.
   float win = smoothstep(-0.015, -0.05, uSun.y) * (1.0 - smoothstep(-0.20, -0.31, uSun.y));
   if (win <= 0.001) return vec3(0.0);
-  float t0, t1;
-  if (!bandRange(ro, rd, 78000.0, 85000.0, 900000.0, t0, t1)) return vec3(0.0);
-  vec3 p = ro + rd * mix(t0, t1, 0.5);
+  float th;
+  if (!shellHit(ro, rd, 81500.0, th)) return vec3(0.0);
+  vec3 p = ro + rd * th;
   vec2 q = p.xz * 0.0000085 + vec2(uTime * 0.0035, 0.0);
-  float n = fbm2(q * 3.0);
-  float bill = (0.30 + 0.70 * smoothstep(0.40, 0.82, n)) * (0.55 + 0.55 * fbm2c(q * 30.0));
+  // The sheet sits 80 km up and is very nearly flat, so the ground distance a
+  // ray reaches goes as h/tan(elevation) — and one pixel of elevation near the
+  // horizon spans tens of kilometres of it. Structure finer than that cannot
+  // be resolved; what it produces instead is a moiré of concentric rings
+  // centred on the zenith, which is what has always been drawn across this
+  // sky. Each scale is faded out as the footprint reaches it.
+  float nfoot = 130.0 / max(rd.y * rd.y, 0.0025);
+  float n    = mix(0.5, fbm2 (q *  3.0), clamp(1.0 - nfoot / 26000.0, 0.0, 1.0));
+  float fine = mix(0.5, fbm2c(q * 30.0), clamp(1.0 - nfoot /  2400.0, 0.0, 1.0));
+  float bill = (0.30 + 0.70 * smoothstep(0.40, 0.82, n)) * (0.55 + 0.55 * fine);
   bill *= smoothstep(0.004, 0.05, rd.y);
   bill *= exp(-max(rd.y - 0.30, 0.0) * 4.5);   // the sheet is a horizon phenomenon
   float fwd = pow(max(dot(rd, uSun) * 0.5 + 0.5, 0.0), 3.0);   // small ice ⇒ forward scattering
@@ -3306,7 +3364,7 @@ const SCENARIOS = [
   { id:"rain", hue:"var(--a)", name:"Rainband", tag:"Tier A · shafts & the bow", g:G.rain,
     desc:"A deep, well-covered deck letting go. Curtains lean downwind as they fall, scud hangs under the base, and with the sun low behind you the 42° bow stands on the rain.",
     set:{ dewDep:17, cape:2600, coverage:0.72, stratus:0.12, cirrus:0, windSpd:11, windDir:272, shear:4,
-          sunElev:14, sunAz:272, haze:0.22, terrain:620, ground:0.22, snow:3600, sea:-400,
+          sunElev:14, sunAz:272, haze:0.22, exposure:1.7, terrain:620, ground:0.22, snow:3600, sea:-400,
           live:0,altoc:1,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
     storm:[6000,9000], cam:[-15000,1780,1400], look:[9000,420,-600] },
 
@@ -3558,6 +3616,10 @@ SCENARIOS.forEach(sc => {
 let currentScn = SCENARIOS[0], inMenu = true, uiHidden = false, frozen = false;
 
 function applyScenario(sc){
+  // Exposure is a property of the scenario, not of whatever you were looking at
+  // before it. Letting it carry over meant a scene's brightness depended on the
+  // order you clicked through the menu.
+  if (!("exposure" in sc.set)) S.exposure = 1.0;
   Object.keys(sc.set).forEach(k => { S[k] = sc.set[k]; });
   EASED.forEach(k => { if (k in sc.set) A[k] = S[k]; });
   stormXZ = sc.storm.slice();

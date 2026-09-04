@@ -81,11 +81,19 @@ settle. The longer you hold the shot the cleaner it gets, which is how a long
 exposure behaves and very nearly why. `Enter` or the shutter button captures the
 frame to a strip you can open, copy or save.
 
-The presentation pass is graded rather than merely tonemapped: a bright-pass
-bloom for the veiling glare a real lens throws across a frame, lateral chromatic
-aberration that grows off-axis, a gentle S-curve and a little saturation, and
-grain that sits in the shadows where film keeps it — which doubles as the dither
-that stops a smooth sky gradient banding into stripes.
+The presentation pass is graded rather than merely tonemapped. It receives linear
+radiance — the frame is never compressed to 8 bits before this point, so a sunlit cloud
+edge still carries the fifty times the radiance of the ground beside it that it should.
+Bloom is a six-level pyramid rather than one Gaussian, because veiling glare in a real
+lens runs from a tight halo around a highlight out to a wash across the whole frame and
+a single blur radius can only be one of those. AgX does the tonemapping: per-channel
+compression skews a bright saturated colour toward white as each channel clips in turn,
+which is why a naively tonemapped sunset goes orange, then yellow, then cream — AgX
+compresses in a basis where the primaries are pulled inward, so hue survives to the top
+of the range. Then the cos⁴ vignette of a real exit pupil (before the tonemap, so the
+corners roll off in exposure rather than merely getting muddier), lateral chromatic
+aberration that grows off-axis, and grain that sits in the shadows where film keeps it —
+which doubles as the dither that stops a smooth sky gradient banding into stripes.
 
 ## Rain and fog
 
@@ -134,17 +142,44 @@ the volumetric shafts, the scope and the audio, so all three agree.
 
 ## How it renders
 
-One fragment shader per frame does the lot: a curvature-corrected raymarch through a
-single participating medium (cloud droplets, dust, ash and fog differ only in their
-scattering coefficients), a heightfield terrain trace, an analytic sky, and a
-scattering-angle pass for the optical phenomena.
+One fragment shader per frame does most of the work: a curvature-corrected raymarch
+through a single participating medium (cloud droplets, dust, ash and fog differ only in
+their scattering coefficients), a heightfield terrain trace, and a scattering-angle pass
+for the optical phenomena. A temporal resolve and a bloom pyramid follow it, and the
+whole chain stays in linear radiance until the final pass.
+
+**The sky is computed, not chosen.** Rayleigh scattering with its λ⁻⁴ wavelength
+dependence, Mie aerosol driven by the haze control, and the ozone layer — which does
+nothing at noon and is why the zenith stays blue rather than grey once the sun is down.
+A 256×64 transmittance table, baked when the aerosol load changes, gives the fraction of
+each wavelength surviving any path; sky radiance is a jittered 16-step integral over it,
+with an isotropic term standing in for the higher orders, without which the sky is far
+too dark and too saturated and there is nothing at all after sunset. Nothing is tuned
+per time of day: the sun reddens at the horizon because its path is long, the sky
+opposite stays blue because that path is short, and cloud bases go orange at sunset
+because the light reaching them came the same long way. Aerial perspective is the same
+integral over a shorter path, so a distant ridge takes the colour of the sky above it.
 
 - Two 3-D noise volumes (Perlin–Worley shape, Worley erosion) are generated on the GPU
-  at load by rendering into texture layers.
+  at load by rendering into texture layers, with mip chains — so a march step of a
+  kilometre reads a value filtered over a kilometre rather than one texel picked out of
+  a 55 m field at random. Where even the coarsest usable level has averaged toward its
+  mean, the carve gives way to the analytic cloud form, since filtered noise dissolves a
+  cloud rather than blurring it.
 - Beer–Powder attenuation with three energy-attenuated scattering octaves and a
   dual-lobe Henyey–Greenstein phase function.
-- The march runs at a fraction of display resolution with a blue-noise-jittered start,
-  and accumulates into a history buffer that converges when the camera is still.
+- Terrain casts its own shadows, and everything it samples — normals, detail, mottle,
+  the self-shadow — is filtered to the pixel's ground *footprint* rather than its
+  distance, using the geometric mean of the two footprint axes, because a grazing ray
+  covers far more ground along the view than across it. Water is a Fresnel dielectric:
+  2% reflective face-on, near total at grazing.
+- The march runs at a fraction of display resolution with a jittered start and one
+  sample per pixel, and a resolve pass merges it into a running average. The history is
+  **reprojected**: each pixel's distance plus the previous frame's camera says where
+  that point was on the last frame, so moving no longer throws the history away. What
+  reprojection cannot handle is disocclusion, so each history sample is clipped into the
+  range of colour its neighbourhood in the current frame contains — mean ± 1.3σ, since a
+  min/max box on a noisy frame is wide enough to let a ghost through.
 - Internal resolution adapts to hold frame time; four quality presets set step counts.
 
 Physical parameters map the way they do in the atmosphere: cloud base is
