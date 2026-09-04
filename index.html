@@ -3312,9 +3312,34 @@ function wxStart(hour){
   const m0 = 0.60 + Math.random() * 0.28;
   WX.seed = Math.asin(Math.max(-1, Math.min(1, 2 * m0 - 1))) - (hour / 24) * 2.13
           + Math.round(Math.random() * 5) * 2 * Math.PI;
-  WX.T = 8; WX.Td = 7; WX.cape = 0; WX.cin = 300; WX.cov = 0; WX.zi = 300;
-  WX.cell = 0; WX.cellAge = 0; WX.anvil = 0; WX.alto = 0; WX.gap = 0.4;
-  wxSeek(hour);
+  const cold = () => {
+    WX.T = 8; WX.Td = 7; WX.cape = 0; WX.cin = 300; WX.cov = 0; WX.zi = 300;
+    WX.cell = 0; WX.cellAge = 0; WX.anvil = 0; WX.alto = 0; WX.gap = 0.4;
+  };
+
+  // Open on an empty sky, and find the hour rather than assume it. Which hour
+  // that is depends on the air mass, and the air mass is random: a moist calm
+  // night holds fog until eight, a breezy one puts a sheet of stratus up
+  // instead, and a dry one is clear from first light. Picking a fixed hour
+  // means opening into whichever of those the day happens to be. Walking the
+  // morning and stopping at the first hour with nothing in it costs a couple of
+  // thousand integrations of arithmetic, once, and always lands on a sky the
+  // day can then be watched building out of.
+  let best = hour, bestSky = 1e9;
+  for (let k = 0; k <= 24; k++){
+    const h = hour - 0.5 + k * 0.25;
+    cold(); wxSeek(h);
+    const dusk  = smoothstepJS(11, 0, S.sunElev);
+    const moist = smoothstepJS(9, 2.5, S.dewDep);
+    const calm  = smoothstepJS(7.5, 1.5, S.windSpd);
+    // Weighted by how much of the sky each fills, plus a small penalty on the
+    // hour so that among equally empty mornings it takes the earliest and
+    // leaves the most of the day to watch.
+    const sky = WX.cov + S.stratus * 0.8 + dusk * moist * calm * 0.9 + k * 0.002;
+    if (sky < bestSky){ bestSky = sky; best = h; }
+    if (sky < 0.02) break;                       // nothing up there; stop looking
+  }
+  cold(); wxSeek(best);
 }
 function stepWeather(dtReal){
   if (S.live < 0.5 || frozen) return;
@@ -3466,10 +3491,10 @@ const SCENARIOS = [
     storm:[30000,26000], cam:[-6000,2000,-10000], look:[30000,33000,26000] },
 
   { id:"live", hue:"var(--b)", name:"Live Sky", tag:"a day, integrated forward", g:G.cumulus,
-    desc:"Nothing here is set. It opens at seven on an empty sky — the night's fog has just gone and the ground has barely begun to warm, so there is almost nothing up there. The ground warms, the mixed layer grows, and when it reaches its condensation level the first cumulus appear. Whether they stay humilis or go up as a storm depends on the moisture and the cap the air mass is carrying. Then the storm eats its own instability, the anvil outlives it as cirrus, and by dusk the sky is empty again. Press L anywhere to switch it on.",
+    desc:"Nothing here is set. It opens on an empty sky, at whatever hour of the morning this particular air mass gives one — a moist calm night holds fog until eight, a breezy one puts up stratus instead, a dry one is clear from first light. Then the ground warms, the mixed layer grows, and when it reaches its condensation level the first cumulus appear. The ground warms, the mixed layer grows, and when it reaches its condensation level the first cumulus appear. Whether they stay humilis or go up as a storm depends on the moisture and the cap the air mass is carrying. Then the storm eats its own instability, the anvil outlives it as cirrus, and by dusk the sky is empty again. Press L anywhere to switch it on.",
     set:{ dewDep:9, cape:0, coverage:0, stratus:0, cirrus:0, windSpd:4, windDir:215, shear:3,
           sunElev:6, sunAz:75, haze:0.42, exposure:1.0, terrain:900, ground:0.18, snow:3200, sea:-400,
-          live:1, tod:7.0, rate:150,
+          live:1, tod:6.0, rate:150,
           altoc:0,bow:1,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
     storm:[14000,16000], cam:[-1600,2250,-9500], look:[2600,3100,3000] },
 
