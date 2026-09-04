@@ -1519,12 +1519,24 @@ void main(){
   col += rainbow(ro, rd, hitG ? tG : 40000.0);
   col += vec3(0.75, 0.82, 1.0) * uFlash * 0.045;
 
-  col = aces(col * uExposure);
+  // The frame stays in linear radiance from here to the present pass. Grading a
+  // tonemapped buffer can only redistribute what the tonemap already threw
+  // away, and a sunlit cloud edge carries fifty times the radiance of the
+  // ground beside it: crush that to 1.0 before the bloom sees it and the lens
+  // veil is built from a flat white blob instead of from the highlight.
+  col = max(col, 0.0);
+  col = min(col, 128.0);                    // clamp only the fireflies, not the sun
 
   vec4 hist = texture(uHist, gl_FragCoord.xy / uRes);
+  // Blend with weights that fall off as radiance rises. A straight lerp in
+  // linear space lets one bright stray sample dominate the average for the next
+  // dozen frames — the classic firefly that never quite fades.
+  float wa = (1.0 - uBlend) / (1.0 + dot(hist.rgb, vec3(0.2126, 0.7152, 0.0722)));
+  float wb =  uBlend        / (1.0 + dot(col,      vec3(0.2126, 0.7152, 0.0722)));
+  vec3  mixed = (hist.rgb * wa + col * wb) / max(wa + wb, 1e-6);
   // Alpha carries the cloud transmittance, so the lightning pass knows what is
   // in front of a channel without needing a depth buffer.
-  outColor = vec4(mix(hist.rgb, col, uBlend), mix(hist.a, cl.a * trA, uBlend));
+  outColor = vec4(mixed, mix(hist.a, cl.a * trA, uBlend));
 }
 </script>
 
@@ -1579,31 +1591,89 @@ void main(){
 }
 </script>
 
-<script id="fsBlur" type="x-shader/x-fragment">#version 300 es
-/* Bright pass and separable blur, for bloom. Real lenses scatter a little of
-   every bright thing across the whole frame — that veil is most of why a sunlit
-   cloud edge reads as bright rather than merely white, and without it a
-   tonemapped render always looks slightly plastic. */
+<script id="fsDown" type="x-shader/x-fragment">#version 300 es
+/* Bloom, downsample half of the chain.
+
+   Veiling glare in a real lens is not one blur radius. Light scatters off every
+   surface and every speck of dust in the barrel, and the result runs from a
+   tight halo around a specular highlight out to a wash across the whole frame.
+   One Gaussian can only ever pick one of those scales; a pyramid — halve,
+   halve again, six times, then add the levels back on the way up — reproduces
+   the whole falloff for about the cost of the single blur it replaces.
+
+   The taps are the 13-tap arrangement from Jimenez's Siggraph 2014 course: a
+   centre quad plus a ring, weighted so that repeated application does not
+   pulse as the source slides by a texel. */
 precision highp float;
 out vec4 outColor;
 uniform sampler2D uTex;
 uniform vec2  uDst;        // destination size, px
 uniform vec2  uSrcTexel;   // 1 / source size
-uniform vec2  uDir;        // (1,0) then (0,1)
-uniform float uThresh;     // >= 0 on the first pass only
+uniform float uThresh;     // soft-knee threshold, first level only (< 0 = off)
+uniform float uExpo;       // exposure, so the knee sits at a fixed display level
+uniform float uKaris;      // 1 on the first level: average by luma, killing fireflies
+
+vec3 tap(vec2 uv, vec2 o){ return texture(uTex, uv + o * uSrcTexel).rgb; }
+float kw(vec3 c){ return 1.0 / (1.0 + dot(c, vec3(0.2126, 0.7152, 0.0722))); }
+
 void main(){
   vec2 uv = gl_FragCoord.xy / uDst;
-  float w[5] = float[5](0.2270, 0.1946, 0.1216, 0.0540, 0.0162);
-  vec3 acc = vec3(0.0);
-  for (int i = -4; i <= 4; i++){
-    vec3 c = texture(uTex, uv + uDir * uSrcTexel * (float(i) * 2.0)).rgb;
-    if (uThresh >= 0.0){
-      float l = max(max(c.r, c.g), c.b);
-      c *= max(l - uThresh, 0.0) / max(l, 1e-4);
-    }
-    acc += c * w[i < 0 ? -i : i];
+  vec3 a = tap(uv, vec2(-2, 2)), b = tap(uv, vec2(0, 2)), c = tap(uv, vec2(2, 2));
+  vec3 d = tap(uv, vec2(-2, 0)), e = tap(uv, vec2(0, 0)), f = tap(uv, vec2(2, 0));
+  vec3 g = tap(uv, vec2(-2,-2)), h = tap(uv, vec2(0,-2)), i = tap(uv, vec2(2,-2));
+  vec3 j = tap(uv, vec2(-1, 1)), k = tap(uv, vec2(1, 1));
+  vec3 l = tap(uv, vec2(-1,-1)), m = tap(uv, vec2(1,-1));
+
+  vec3 res;
+  if (uKaris > 0.5){
+    // Weight each of the five quads by its own inverse luma before averaging.
+    // Without it a single blown-out sample survives every level of the pyramid
+    // and lands in the final frame as a fat, flickering blob.
+    vec3 q0 = j + k + l + m, q1 = a + b + d + e, q2 = b + c + e + f;
+    vec3 q3 = d + e + g + h, q4 = e + f + h + i;
+    float w0 = kw(q0 * 0.25) * 0.5, w1 = kw(q1 * 0.25) * 0.125;
+    float w2 = kw(q2 * 0.25) * 0.125, w3 = kw(q3 * 0.25) * 0.125, w4 = kw(q4 * 0.25) * 0.125;
+    res = (q0 * w0 + q1 * w1 + q2 * w2 + q3 * w3 + q4 * w4) * 0.25
+        / max(w0 + w1 + w2 + w3 + w4, 1e-5);
+  } else {
+    res = e * 0.125 + (a + c + g + i) * 0.03125 + (b + d + f + h) * 0.0625
+        + (j + k + l + m) * 0.125;
   }
-  outColor = vec4(acc, 1.0);
+
+  if (uThresh >= 0.0){
+    // Soft knee. A hard cut makes the bloom pop on and off as a highlight
+    // drifts across the threshold; the quadratic shoulder is continuous.
+    res *= uExpo;
+    float lum = max(max(res.r, res.g), res.b);
+    float knee = uThresh * 0.6;
+    float s = clamp(lum - uThresh + knee, 0.0, 2.0 * knee);
+    s = s * s / (4.0 * knee + 1e-5);
+    res *= max(max(s, lum - uThresh), 0.0) / max(lum, 1e-5);
+  }
+  outColor = vec4(res, 1.0);
+}
+</script>
+
+<script id="fsUp" type="x-shader/x-fragment">#version 300 es
+/* Bloom, upsample half. A 3×3 tent read from the smaller level, added onto the
+   larger one — the widths compound, so the sum over the pyramid is a smooth
+   power-law falloff rather than a stack of visible rings. */
+precision highp float;
+out vec4 outColor;
+uniform sampler2D uTex;
+uniform vec2  uDst;
+uniform vec2  uSrcTexel;
+uniform float uRadius;
+
+void main(){
+  vec2 uv = gl_FragCoord.xy / uDst;
+  vec2 o = uSrcTexel * uRadius;
+  vec3 s = texture(uTex, uv + vec2(-o.x,  o.y)).rgb       + texture(uTex, uv + vec2(0.0,  o.y)).rgb * 2.0
+         + texture(uTex, uv + vec2( o.x,  o.y)).rgb       + texture(uTex, uv + vec2(-o.x, 0.0)).rgb * 2.0
+         + texture(uTex, uv).rgb * 4.0                    + texture(uTex, uv + vec2( o.x, 0.0)).rgb * 2.0
+         + texture(uTex, uv + vec2(-o.x, -o.y)).rgb       + texture(uTex, uv + vec2(0.0, -o.y)).rgb * 2.0
+         + texture(uTex, uv + vec2( o.x, -o.y)).rgb;
+  outColor = vec4(s * 0.0625, 1.0);
 }
 </script>
 
@@ -1614,10 +1684,50 @@ uniform sampler2D uTex;
 uniform sampler2D uBloom;
 uniform vec2 uRes;
 uniform float uSharp, uRain, uTime;
-uniform float uBloomAmt, uCA, uGrain, uGrade, uSat;
+uniform float uBloomAmt, uCA, uGrain, uGrade, uSat, uExpo, uVig;
 uniform vec2 uRainDir;
 
 float rhash(vec2 p){ return fract(sin(dot(p, vec2(41.3, 289.1))) * 43758.5453); }
+
+/* ── AgX ───────────────────────────────────────────────────────────────────
+   The frame arrives in linear radiance with a range of several hundred to one:
+   the sun's own disc against terrain in cloud shadow. Every tonemapper has to
+   compress that, and the usual ones do it per channel, so a saturated bright
+   colour loses whichever channel clips first and skews in hue on its way to
+   white — the reason a naively tonemapped sunset goes orange, then yellow,
+   then a flat cream, instead of staying orange and simply getting brighter.
+
+   AgX first rotates into a basis where the primaries are pulled inward, so
+   compression bleeds a little energy between channels, then applies the
+   sigmoid in log exposure. Bright saturated things desaturate gradually and
+   keep their hue all the way up. Same reason film does. */
+const mat3 agxIn = mat3(
+  0.8424790622, 0.0423282422, 0.0423756549,
+  0.0784336000, 0.8784686364, 0.0784336000,
+  0.0792237451, 0.0791661274, 0.8791429737);
+const mat3 agxOut = mat3(
+   1.1968790051, -0.0528968517, -0.0529716355,
+  -0.0980208811,  1.1519031299, -0.0980434501,
+  -0.0990297440, -0.0989611768,  1.1510736726);
+
+vec3 agxSigmoid(vec3 x){
+  vec3 x2 = x * x, x4 = x2 * x2;
+  return 15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4
+       - 6.868 * x2 * x + 0.4298 * x2 + 0.1191 * x - 0.00232;
+}
+vec3 agx(vec3 c){
+  const float lo = -12.47393, hi = 4.026069;   // the sensor's usable stops
+  c = agxIn * max(c, 0.0);
+  c = clamp(log2(max(c, 1e-10)), lo, hi);
+  return agxSigmoid((c - lo) / (hi - lo));
+}
+vec3 agxLook(vec3 c, float sat){
+  // The print stage: a touch of gamma for contrast, then saturation back, since
+  // the sigmoid necessarily takes some out.
+  float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
+  c = pow(max(c, 0.0), vec3(1.28));
+  return max(lum + (1.0 + sat) * (c - lum), 0.0);
+}
 
 // One layer of wind-slanted streaks. Cells that fail the threshold stay empty,
 // so the rain reads as discrete drops rather than a screen-door pattern.
@@ -1646,11 +1756,36 @@ void main(){
   } else {
     c = texture(uTex, uv).rgb;
   }
+
+  // ── everything down to the tonemap happens in linear radiance ──
+  c *= uExpo;
+  c += texture(uBloom, uv).rgb * uBloomAmt;
+
+  // Vignette. Not a dark ring painted on the corners: the cos⁴ falloff a real
+  // lens has, because a corner ray leaves the exit pupil obliquely and crosses
+  // a foreshortened aperture. Applied before the tonemap, so the corners roll
+  // off in exposure rather than merely getting muddier.
+  if (uVig > 0.0){
+    float ct = inversesqrt(1.0 + r2 * 4.0 * uVig);
+    c *= mix(1.0, ct * ct * ct * ct, 0.85);
+  }
+
+  // The sigmoid already lands in display-encoded values — it is fitted against
+  // the 2.2 curve — so the outset matrix is the last step, and putting another
+  // gamma after it is what turns the whole frame milky.
+  c = clamp(agxOut * agxLook(agx(c), uSat), 0.0, 1.0);
+  c = mix(c, c * c * (3.0 - 2.0 * c), uGrade);
+
   if (uSharp > 0.0){
+    // Unsharp against a cross of neighbours. This runs on the display-encoded
+    // image on purpose: sharpening linear radiance haloes around highlights.
     vec2 px = 1.0 / uRes;
-    vec3 b = texture(uTex, uv + vec2( px.x, 0.0)).rgb + texture(uTex, uv - vec2(px.x, 0.0)).rgb
-           + texture(uTex, uv + vec2(0.0, px.y)).rgb + texture(uTex, uv - vec2(0.0, px.y)).rgb;
-    c = clamp(c + (c * 4.0 - b) * uSharp * 0.25, 0.0, 1.0);
+    vec3 b = pow(max(texture(uTex, uv + vec2(px.x, 0.0)).rgb, 0.0), vec3(0.2))
+           + pow(max(texture(uTex, uv - vec2(px.x, 0.0)).rgb, 0.0), vec3(0.2))
+           + pow(max(texture(uTex, uv + vec2(0.0, px.y)).rgb, 0.0), vec3(0.2))
+           + pow(max(texture(uTex, uv - vec2(0.0, px.y)).rgb, 0.0), vec3(0.2));
+    vec3 cc = pow(max(texture(uTex, uv).rgb, 0.0), vec3(0.2));
+    c = clamp(c + (cc * 4.0 - b) * uSharp * 0.22, 0.0, 1.0);
   }
   if (uRain > 0.001){
     // Work in a frame aligned with the fall direction so the streaks slant with
@@ -1665,16 +1800,8 @@ void main(){
     c += vec3(0.62, 0.70, 0.82) * s * uRain * 0.62;
     c = mix(c, vec3(0.34, 0.38, 0.44), uRain * 0.13);      // the air itself greys out
   }
-
-  c += texture(uBloom, uv).rgb * uBloomAmt;
-
-  // Grade: the tonemap alone leaves everything a shade flat, so put a gentle
-  // S-curve through the midtones and a little saturation back, the way a print
-  // is graded rather than the way a sensor reads.
   c = clamp(c, 0.0, 1.0);
-  c = mix(c, c * c * (3.0 - 2.0 * c), uGrade);
   float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
-  c = clamp(mix(vec3(lum), c, 1.0 + uSat), 0.0, 1.0);
 
   // Grain, and with it the dither that keeps a smooth sky gradient from
   // banding into stripes across eight-bit output. Grain belongs in the
@@ -1730,13 +1857,14 @@ function program(vsSrc, fsSrc, name) {
 }
 const src = id => document.getElementById(id).textContent;
 
-let progMain, progNoise, progPresent, progBolt, progBlur;
+let progMain, progNoise, progPresent, progBolt, progDown, progUp;
 try {
   boot("compiling atmosphere shader…", 0.1);
   progNoise   = program(src("vs"), src("fsNoise"),   "noise");
   progMain    = program(src("vs"), src("fsMain"),    "main");
   progPresent = program(src("vs"), src("fsPresent"), "present");
-  progBlur    = program(src("vs"), src("fsBlur"), "blur");
+  progDown    = program(src("vs"), src("fsDown"), "bloom-down");
+  progUp      = program(src("vs"), src("fsUp"),   "bloom-up");
   progBolt    = program(src("vsBolt"), src("fsBolt"), "bolt");
 } catch (e) {
   document.getElementById("boot").innerHTML =
@@ -1809,14 +1937,31 @@ const texShape  = newVolume(SHAPE_N);
 const texDetail = newVolume(DETAIL_N);
 
 /* ══════════════════════════ accumulation targets ══════════════════════════ */
+/* Everything between the march and the present pass is linear radiance in a
+   float buffer. An 8-bit buffer cannot hold it: the sun's disc is some four
+   hundred times the radiance of the ground under an overcast, and tonemapping
+   before the accumulate would throw that away permanently — the bloom would
+   then be built from clipped white, and no amount of grading afterwards can
+   put the highlight roll-off back. Half floats are enough (they carry ~11 bits
+   of mantissa over a range of 10^±5) and cost half the bandwidth of full. */
 let rtW = 0, rtH = 0, rts = [null, null], fbos = [null, null], cur = 0;
-let blW = 0, blH = 0, blT = [null, null], blF = [null, null];
-function makeTarget(w, h) {
+const fmtHDR = (() => {
+  // Rendering TO a float texture is an extension even in WebGL2.
+  if (gl.getExtension("EXT_color_buffer_float")) return gl.RGBA16F;
+  if (gl.getExtension("EXT_color_buffer_half_float")) return gl.RGBA16F;
+  return gl.RGBA8;
+})();
+const hdrOK = fmtHDR !== gl.RGBA8;
+// A half-float texture is only linearly filterable with this second extension;
+// without it the bloom pyramid would have to point-sample and would crawl.
+const hdrFilter = hdrOK && !!gl.getExtension("OES_texture_float_linear");
+function makeTarget(w, h, hdr) {
   const t = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, t);
-  gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, w, h);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texStorage2D(gl.TEXTURE_2D, 1, hdr ? fmtHDR : gl.RGBA8, w, h);
+  const lin = (!hdr || hdrFilter) ? gl.LINEAR : gl.NEAREST;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, lin);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, lin);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
   const f = gl.createFramebuffer();
@@ -1825,46 +1970,70 @@ function makeTarget(w, h) {
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   return [t, f];
 }
+// Bloom pyramid: successive halvings of the frame, each its own target.
+const BLOOM_MAX = 6;
+let bloomLv = [];       // [{w,h,tex,fbo}], level 0 = half resolution
 function resizeTargets(w, h) {
   if (w === rtW && h === rtH) return;
   rtW = w; rtH = h;
   for (let i = 0; i < 2; i++) {
     if (rts[i]) { gl.deleteTexture(rts[i]); gl.deleteFramebuffer(fbos[i]); }
-    const [t, f] = makeTarget(w, h);
+    const [t, f] = makeTarget(w, h, hdrOK);
     rts[i] = t; fbos[i] = f;
   }
-  blW = Math.max(32, w >> 1); blH = Math.max(18, h >> 1);
-  for (let i = 0; i < 2; i++) {
-    if (blT[i]) { gl.deleteTexture(blT[i]); gl.deleteFramebuffer(blF[i]); }
-    const [t, f] = makeTarget(blW, blH);
-    blT[i] = t; blF[i] = f;
+  for (const L of bloomLv) { gl.deleteTexture(L.tex); gl.deleteFramebuffer(L.fbo); }
+  bloomLv = [];
+  let bw = w, bh = h;
+  for (let i = 0; i < BLOOM_MAX; i++) {
+    bw = Math.max(2, bw >> 1); bh = Math.max(2, bh >> 1);
+    const [t, f] = makeTarget(bw, bh, hdrOK);
+    bloomLv.push({ w: bw, h: bh, tex: t, fbo: f });
+    if (bw <= 8 || bh <= 8) break;
   }
   accum = 0;
 }
 
-/* Bright-pass and blur the composited frame into blT[1], for the present pass
-   to add back as bloom. */
-function bloomPass(srcTex){
-  gl.useProgram(progBlur);
-  const u = progBlur.u;
-  gl.viewport(0, 0, blW, blH);
-  gl.uniform2f(u.uDst, blW, blH);
+/* Build the pyramid: threshold on the way down, tent-filtered add on the way
+   up. Level 0 ends up holding the sum of every scale, which the present pass
+   adds back over the frame. */
+function bloomPass(srcTex, expo){
   gl.activeTexture(gl.TEXTURE0);
+  gl.useProgram(progDown);
+  let du = progDown.u;
+  gl.uniform1i(du.uTex, 0);
+  gl.uniform1f(du.uExpo, expo);
+  let sw = rtW, sh = rtH, src = srcTex;
+  for (let i = 0; i < bloomLv.length; i++) {
+    const L = bloomLv[i];
+    gl.bindFramebuffer(gl.FRAMEBUFFER, L.fbo);
+    gl.viewport(0, 0, L.w, L.h);
+    gl.bindTexture(gl.TEXTURE_2D, src);
+    gl.uniform2f(du.uDst, L.w, L.h);
+    gl.uniform2f(du.uSrcTexel, 1 / sw, 1 / sh);
+    // Threshold and firefly-weighting only where the full-resolution frame is
+    // still intact; doing it again further down would eat the tails.
+    gl.uniform1f(du.uThresh, i === 0 ? 1.05 : -1);
+    gl.uniform1f(du.uKaris, i === 0 ? 1 : 0);
+    drawQuad();
+    src = L.tex; sw = L.w; sh = L.h;
+  }
 
-  gl.bindFramebuffer(gl.FRAMEBUFFER, blF[0]);
-  gl.bindTexture(gl.TEXTURE_2D, srcTex);
-  gl.uniform1i(u.uTex, 0);
-  gl.uniform2f(u.uSrcTexel, 1 / rtW, 1 / rtH);
-  gl.uniform2f(u.uDir, 1, 0);
-  gl.uniform1f(u.uThresh, 0.62);
-  drawQuad();
-
-  gl.bindFramebuffer(gl.FRAMEBUFFER, blF[1]);
-  gl.bindTexture(gl.TEXTURE_2D, blT[0]);
-  gl.uniform2f(u.uSrcTexel, 1 / blW, 1 / blH);
-  gl.uniform2f(u.uDir, 0, 1);
-  gl.uniform1f(u.uThresh, -1);
-  drawQuad();
+  gl.useProgram(progUp);
+  const uu = progUp.u;
+  gl.uniform1i(uu.uTex, 0);
+  gl.uniform1f(uu.uRadius, 1.0);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE);
+  for (let i = bloomLv.length - 1; i > 0; i--) {
+    const from = bloomLv[i], to = bloomLv[i - 1];
+    gl.bindFramebuffer(gl.FRAMEBUFFER, to.fbo);
+    gl.viewport(0, 0, to.w, to.h);
+    gl.bindTexture(gl.TEXTURE_2D, from.tex);
+    gl.uniform2f(uu.uDst, to.w, to.h);
+    gl.uniform2f(uu.uSrcTexel, 1 / from.w, 1 / from.h);
+    drawQuad();
+  }
+  gl.disable(gl.BLEND);
 }
 
 /* ══════════════════════════ state ══════════════════════════ */
@@ -3236,10 +3405,17 @@ function frame(now){
   audioFrame(dt, rainAmt, camMoved ? Math.min(1, cam.speed / 900) : 0);
   // Frozen means frozen: with time stopped there is nothing left moving for
   // the accumulation buffer to chase, which is what lets a held shot converge.
+  // A running storm is NOT "busy". Its turrets breathe over tens of seconds, so
+  // almost all of last frame is still true; treating it as motion held the
+  // blend at 0.55 forever, which is two frames of averaging against a density
+  // field full of detail finer than one march step — the stipple that used to
+  // crawl all over every convective scene. It gets a raised blend floor
+  // instead, below, so the tops still track without the buffer starting over.
+  const stormLive = !frozen && A.super > 0.02;
   const busy = camMoved || easing || (!frozen && (ev.flash > 0.02 || A.ball > 0.02
-             || bolts.length > 0 || A.super > 0.02));
+             || bolts.length > 0));
   if (busy) accum = 0; else accum++;
-  const fast = Math.max(A.torn, A.micro, A.haboob, A.ash, A.super * 0.5);
+  const fast = Math.max(A.torn, A.micro, A.haboob, A.ash, stormLive ? 0.28 : 0);
   // A fast clock is a time-lapse: the less real time each frame stands for,
   // the less of the previous frame is still true.
   const live = (S.live > 0.5 && !frozen) ? Math.min(0.45, S.rate / 900 * 0.5) : 0;
@@ -3260,20 +3436,23 @@ function frame(now){
   setUniforms(b);
   drawQuad();
 
-  bloomPass(rts[cur]);
+  const expo = S.exposure * 1.05;
+  bloomPass(rts[cur], expo);
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   gl.viewport(0, 0, cv.width, cv.height);
   gl.useProgram(progPresent);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, rts[cur]);
   gl.uniform1i(progPresent.u.uTex, 0);
-  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, blT[1]);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, bloomLv[0].tex);
   gl.uniform1i(progPresent.u.uBloom, 1);
   gl.activeTexture(gl.TEXTURE0);
-  gl.uniform1f(progPresent.u.uBloomAmt, 0.52);
+  gl.uniform1f(progPresent.u.uExpo, expo);
+  gl.uniform1f(progPresent.u.uBloomAmt, 0.055);
+  gl.uniform1f(progPresent.u.uVig, photo ? 0.30 : 0.22);
   gl.uniform1f(progPresent.u.uCA, photo ? 0.0022 : 0.0016);
   gl.uniform1f(progPresent.u.uGrain, photo ? 0.020 : 0.013);
-  gl.uniform1f(progPresent.u.uGrade, 0.20);
-  gl.uniform1f(progPresent.u.uSat, 0.10);
+  gl.uniform1f(progPresent.u.uGrade, 0.10);
+  gl.uniform1f(progPresent.u.uSat, 0.36);
   gl.uniform2f(progPresent.u.uRes, cv.width, cv.height);
   gl.uniform1f(progPresent.u.uSharp, sc < 0.95 ? QUALITY[S.quality].sharp : 0.0);
   gl.uniform1f(progPresent.u.uTime, tSim);
