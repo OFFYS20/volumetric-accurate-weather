@@ -20,13 +20,15 @@ Open `index.html` in a browser with WebGL2 and hardware acceleration.
 | Scenarios | `Esc` returns to the menu |
 | Chase lock | `F` — the camera rides along with the storm's motion |
 | Radar | `R` toggles the reflectivity scope |
+| Live weather | `L` — hand the sky to the simulation and let the day run |
+| Photo mode | `P` — hold the shot and let it converge; `Enter` is the shutter |
 | Interface | `Tab` toggles the control panel, `H` hides everything |
 
 Touch devices get an on-screen pad; drag still looks around.
 
 ## What it simulates
 
-Eleven scenarios set up an environment; the phenomena then follow from it.
+Twelve scenarios set up an environment; the phenomena then follow from it.
 
 - **Tier A** — cumuliform and stratiform decks, altocumulus billow rows, rain shafts
   and the scud under them, virga, radiation fog, crepuscular rays, the 42° rainbow with
@@ -40,6 +42,51 @@ Eleven scenarios set up an environment; the phenomena then follow from it.
 - **Tier C** — red sprites, noctilucent cloud, ball lightning, fallstreak holes,
   glories, light pillars.
 
+## The live sky
+
+Every other scenario hands you an atmosphere and lets you take it apart. **Live
+Sky** hands you a clock instead. Nothing is switched on: the sun heats the
+ground, the ground grows a mixed layer, and when that layer reaches its
+condensation level the first cumulus appear. Whether they stay humilis or go up
+as a storm depends on the moisture and the inversion the air mass happens to be
+carrying that day.
+
+So the cloud cycle is the real one. A morning cap holds the field flat until the
+surface warms enough to break it — not until the clock says two, but until the
+ground says so, which is why a cool day stays blue however much water is under
+it. Cloud base climbs all day because the temperature climbs and the dew point
+does not. A pulse cell lives about fifty minutes: it goes up, it rains, and its
+own rain-cooled downdraft cuts off the inflow feeding it. Add shear and the
+updraft and downdraft stop sitting on top of each other, which is exactly why a
+sheared storm lasts hours instead of minutes. The storm eats the instability
+that built it, so the sky quietens behind it. The anvil outlives the storm as
+cirrus. At sunset the mixed layer collapses and the cumulus evaporate with it —
+and then the ground radiates its heat away, the air cools to its dew point, and
+fog forms in the valleys.
+
+The air mass drifts on several incommensurate clocks, so the days do not repeat:
+some are capped and boring, some go up at two, some fog over at dawn. `L` turns
+it on in any scenario; the time-of-day slider scrubs the clock and the clock
+speed sets the pace. Take hold of any slider the engine is driving and it hands
+that control back to you.
+
+## Photographs
+
+The march is stochastic — every frame it jitters its sample positions and folds
+the result into a history buffer — so a still camera keeps converging on the
+answer instead of sitting on one noisy estimate of it. **Photo mode** (`P`) is
+that taken seriously: it holds the world still, renders at full internal
+resolution with the step count up, hides the interface, and lets the image
+settle. The longer you hold the shot the cleaner it gets, which is how a long
+exposure behaves and very nearly why. `Enter` or the shutter button captures the
+frame to a strip you can open, copy or save.
+
+The presentation pass is graded rather than merely tonemapped: a bright-pass
+bloom for the veiling glare a real lens throws across a frame, lateral chromatic
+aberration that grows off-axis, a gentle S-curve and a little saturation, and
+grain that sits in the shadows where film keeps it — which doubles as the dither
+that stops a smooth sky gradient banding into stripes.
+
 ## Rain and fog
 
 Rain is a volume, not a texture: shafts hang out of the base of any deck deep enough
@@ -50,14 +97,23 @@ and sit in the cloud's own shadow, which is what makes a curtain a translucent
 blue-grey veil rather than more cloud. Under a supercell the core is one-sided —
 downwind of the updraft — so the rain-free wedge a chaser parks in stays open.
 
+Terrain carries a valley network: the level set of a warped noise field is a
+set of continuous branching lines, which is what a drainage network is, so
+sharpening it into a trench and cutting relative to the local relief gives a
+trunk valley with tributaries and a floor near the regional base level. That
+common floor is what lets the fog pond in it as one sheet.
+
 Radiation fog is not a switch. It forms where three conditions coincide: the ground is
 radiating (sun near or below the horizon), the air is near saturation (small dew-point
 depression), and the wind is light enough not to mix the cold surface layer away. Raise
 the wind above about 7 m/s and it disappears. Because cold air is dense and runs
 downhill, the top of a fog bank is a *level* surface rather than a blanket following the
 ground — it fills the terrain the way water fills a basin, and ridges stand out of it as
-islands. Different basins pond to different depths. The **Valley Dusk** scenario switches
-nothing on at all; it just sets an environment in which fog has to form.
+islands. Different basins pond to different depths, and the level is read off the
+terrain you are actually over, because a fixed depth in metres cannot be right
+twice — 250 m of fog drowns a landscape with 300 m of relief and barely wets one
+with 1500 m. The **Valley Dusk** scenario switches nothing on at all; it just
+sets an environment in which fog has to form.
 
 ## Chasing
 

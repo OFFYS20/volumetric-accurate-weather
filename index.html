@@ -27,6 +27,33 @@ body{
 }
 canvas#gl{position:fixed;inset:0;width:100%;height:100%;display:block;z-index:0;cursor:grab}
 canvas#gl.drag{cursor:grabbing}
+#photo{position:fixed;inset:0;z-index:6;pointer-events:none;
+  font-family:"JetBrains Mono",ui-monospace,monospace}
+#photo.hidden{display:none}
+#photo::before,#photo::after{content:"";position:fixed;left:0;right:0;height:6vh;
+  background:#05070c;pointer-events:none}
+#photo::before{top:0} #photo::after{bottom:0}
+#phBar{position:fixed;left:0;right:0;bottom:0;height:6vh;min-height:44px;z-index:2;
+  display:flex;align-items:center;gap:12px;padding:0 16px;pointer-events:auto;
+  font-size:11px;letter-spacing:.10em;color:var(--ink-2);text-transform:uppercase}
+#phBar .grow{flex:1}
+#phState{color:var(--b)}
+#phRoll{position:fixed;right:14px;top:calc(6vh + 12px);z-index:2;display:flex;
+  flex-direction:column;gap:8px;pointer-events:auto}
+#phRoll img{width:104px;border-radius:4px;border:1px solid var(--line);
+  cursor:pointer;display:block;background:#05070c}
+#phGuide{position:fixed;left:6%;right:6%;top:calc(6vh + 8%);bottom:calc(6vh + 8%);
+  border:1px solid rgba(230,240,255,.13);pointer-events:none}
+#phGuide::before,#phGuide::after{content:"";position:absolute;background:rgba(230,240,255,.10)}
+#phGuide::before{left:33.33%;right:33.33%;top:0;bottom:0;border-left:1px solid rgba(230,240,255,.10);
+  border-right:1px solid rgba(230,240,255,.10);background:none}
+#phGuide::after{top:33.33%;bottom:33.33%;left:0;right:0;border-top:1px solid rgba(230,240,255,.10);
+  border-bottom:1px solid rgba(230,240,255,.10);background:none}
+#phView{position:fixed;inset:0;z-index:3;background:rgba(4,6,11,.92);display:flex;
+  flex-direction:column;align-items:center;justify-content:center;gap:14px;pointer-events:auto}
+#phView.hidden{display:none}
+#phView img{max-width:88vw;max-height:76vh;border:1px solid var(--line);border-radius:5px}
+#phAct{display:flex;gap:10px}
 #vignette{position:fixed;inset:0;z-index:1;pointer-events:none;
   background:radial-gradient(120% 90% at 50% 45%,transparent 45%,rgba(2,4,8,.55) 100%)}
 .mono{font-family:"JetBrains Mono",ui-monospace,monospace}
@@ -171,6 +198,24 @@ body.touch #hint{display:none}
 
 <canvas id="gl"></canvas>
 <div id="vignette"></div>
+<div id="photo" class="hidden">
+  <div id="phGuide"></div>
+  <div id="phBar">
+    <span id="phInfo">—</span><span class="grow"></span>
+    <span id="phState"></span>
+    <button class="btn" id="phShot">&#9679;&nbsp; Shutter</button>
+    <button class="btn" id="phExit">Exit</button>
+  </div>
+  <div id="phRoll"></div>
+  <div id="phView" class="hidden">
+    <img id="phImg" alt="Captured frame">
+    <div id="phAct">
+      <button class="btn" id="phCopy">Copy image</button>
+      <button class="btn" id="phDl">Download</button>
+      <button class="btn" id="phClose">Close</button>
+    </div>
+  </div>
+</div>
 
 <!-- ─────────────────────────── boot ─────────────────────────── -->
 <div id="boot" class="overlay">
@@ -231,7 +276,7 @@ body.touch #hint{display:none}
 
   <aside id="panel" aria-label="Atmosphere controls"></aside>
 
-  <div id="hint">drag to look · W A S D fly · Q E up/down · Shift boost · scroll speed · <b>F</b> chase lock · <b>R</b> radar</div>
+  <div id="hint">drag to look · W A S D fly · Q E up/down · Shift boost · scroll speed · <b>L</b> live weather · <b>P</b> photo · <b>F</b> chase lock · <b>R</b> radar</div>
 
   <div id="pads" aria-hidden="true">
     <button data-pad="up">&#9650;</button><button data-pad="fwd">&#8593;</button><button data-pad="down">&#9660;</button>
@@ -1534,12 +1579,42 @@ void main(){
 }
 </script>
 
+<script id="fsBlur" type="x-shader/x-fragment">#version 300 es
+/* Bright pass and separable blur, for bloom. Real lenses scatter a little of
+   every bright thing across the whole frame — that veil is most of why a sunlit
+   cloud edge reads as bright rather than merely white, and without it a
+   tonemapped render always looks slightly plastic. */
+precision highp float;
+out vec4 outColor;
+uniform sampler2D uTex;
+uniform vec2  uDst;        // destination size, px
+uniform vec2  uSrcTexel;   // 1 / source size
+uniform vec2  uDir;        // (1,0) then (0,1)
+uniform float uThresh;     // >= 0 on the first pass only
+void main(){
+  vec2 uv = gl_FragCoord.xy / uDst;
+  float w[5] = float[5](0.2270, 0.1946, 0.1216, 0.0540, 0.0162);
+  vec3 acc = vec3(0.0);
+  for (int i = -4; i <= 4; i++){
+    vec3 c = texture(uTex, uv + uDir * uSrcTexel * (float(i) * 2.0)).rgb;
+    if (uThresh >= 0.0){
+      float l = max(max(c.r, c.g), c.b);
+      c *= max(l - uThresh, 0.0) / max(l, 1e-4);
+    }
+    acc += c * w[i < 0 ? -i : i];
+  }
+  outColor = vec4(acc, 1.0);
+}
+</script>
+
 <script id="fsPresent" type="x-shader/x-fragment">#version 300 es
 precision highp float;
 out vec4 outColor;
 uniform sampler2D uTex;
+uniform sampler2D uBloom;
 uniform vec2 uRes;
 uniform float uSharp, uRain, uTime;
+uniform float uBloomAmt, uCA, uGrain, uGrade, uSat;
 uniform vec2 uRainDir;
 
 float rhash(vec2 p){ return fract(sin(dot(p, vec2(41.3, 289.1))) * 43758.5453); }
@@ -1560,7 +1635,17 @@ float rainLayer(vec2 rp, float scale, float speed, float thresh, float t){
 
 void main(){
   vec2 uv = gl_FragCoord.xy / uRes;
-  vec3 c = texture(uTex, uv).rgb;
+  // Lateral chromatic aberration: a lens does not bring every wavelength to
+  // the same focus, and the error grows with distance from the axis.
+  vec2  off = uv - 0.5;
+  float r2  = dot(off, off);
+  vec3 c;
+  if (uCA > 0.0){
+    vec2 ca = off * r2 * uCA;
+    c = vec3(texture(uTex, uv + ca).r, texture(uTex, uv).g, texture(uTex, uv - ca).b);
+  } else {
+    c = texture(uTex, uv).rgb;
+  }
   if (uSharp > 0.0){
     vec2 px = 1.0 / uRes;
     vec3 b = texture(uTex, uv + vec2( px.x, 0.0)).rgb + texture(uTex, uv - vec2(px.x, 0.0)).rgb
@@ -1581,9 +1666,23 @@ void main(){
     c = mix(c, vec3(0.34, 0.38, 0.44), uRain * 0.13);      // the air itself greys out
   }
 
-  // Subtle filmic grain keeps the low-resolution march from banding.
-  float g = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
-  outColor = vec4(c + (g - 0.5) * 0.006, 1.0);
+  c += texture(uBloom, uv).rgb * uBloomAmt;
+
+  // Grade: the tonemap alone leaves everything a shade flat, so put a gentle
+  // S-curve through the midtones and a little saturation back, the way a print
+  // is graded rather than the way a sensor reads.
+  c = clamp(c, 0.0, 1.0);
+  c = mix(c, c * c * (3.0 - 2.0 * c), uGrade);
+  float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
+  c = clamp(mix(vec3(lum), c, 1.0 + uSat), 0.0, 1.0);
+
+  // Grain, and with it the dither that keeps a smooth sky gradient from
+  // banding into stripes across eight-bit output. Grain belongs in the
+  // shadows: a bright part of a frame is nearly saturated and records less.
+  float g = rhash(gl_FragCoord.xy + fract(uTime * 0.37) * 719.3) - 0.5;
+  c += g * (uGrain * (0.30 + 1.0 * (1.0 - smoothstep(0.0, 0.65, lum))) + 1.4 / 255.0);
+
+  outColor = vec4(c, 1.0);
 }
 </script>
 
@@ -1631,12 +1730,13 @@ function program(vsSrc, fsSrc, name) {
 }
 const src = id => document.getElementById(id).textContent;
 
-let progMain, progNoise, progPresent, progBolt;
+let progMain, progNoise, progPresent, progBolt, progBlur;
 try {
   boot("compiling atmosphere shader…", 0.1);
   progNoise   = program(src("vs"), src("fsNoise"),   "noise");
   progMain    = program(src("vs"), src("fsMain"),    "main");
   progPresent = program(src("vs"), src("fsPresent"), "present");
+  progBlur    = program(src("vs"), src("fsBlur"), "blur");
   progBolt    = program(src("vsBolt"), src("fsBolt"), "bolt");
 } catch (e) {
   document.getElementById("boot").innerHTML =
@@ -1710,6 +1810,7 @@ const texDetail = newVolume(DETAIL_N);
 
 /* ══════════════════════════ accumulation targets ══════════════════════════ */
 let rtW = 0, rtH = 0, rts = [null, null], fbos = [null, null], cur = 0;
+let blW = 0, blH = 0, blT = [null, null], blF = [null, null];
 function makeTarget(w, h) {
   const t = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, t);
@@ -1732,7 +1833,38 @@ function resizeTargets(w, h) {
     const [t, f] = makeTarget(w, h);
     rts[i] = t; fbos[i] = f;
   }
+  blW = Math.max(32, w >> 1); blH = Math.max(18, h >> 1);
+  for (let i = 0; i < 2; i++) {
+    if (blT[i]) { gl.deleteTexture(blT[i]); gl.deleteFramebuffer(blF[i]); }
+    const [t, f] = makeTarget(blW, blH);
+    blT[i] = t; blF[i] = f;
+  }
   accum = 0;
+}
+
+/* Bright-pass and blur the composited frame into blT[1], for the present pass
+   to add back as bloom. */
+function bloomPass(srcTex){
+  gl.useProgram(progBlur);
+  const u = progBlur.u;
+  gl.viewport(0, 0, blW, blH);
+  gl.uniform2f(u.uDst, blW, blH);
+  gl.activeTexture(gl.TEXTURE0);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, blF[0]);
+  gl.bindTexture(gl.TEXTURE_2D, srcTex);
+  gl.uniform1i(u.uTex, 0);
+  gl.uniform2f(u.uSrcTexel, 1 / rtW, 1 / rtH);
+  gl.uniform2f(u.uDir, 1, 0);
+  gl.uniform1f(u.uThresh, 0.62);
+  drawQuad();
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, blF[1]);
+  gl.bindTexture(gl.TEXTURE_2D, blT[0]);
+  gl.uniform2f(u.uSrcTexel, 1 / blW, 1 / blH);
+  gl.uniform2f(u.uDir, 0, 1);
+  gl.uniform1f(u.uThresh, -1);
+  drawQuad();
 }
 
 /* ══════════════════════════ state ══════════════════════════ */
@@ -2245,11 +2377,15 @@ function wxIntegrate(dh){
     if (WX.gap <= 0 && S.cape > 820 && uncapped > 0.55 && WX.cov > 0.13 && insol > 0.10){
       WX.cell = 0.0006; WX.cellAge = 0;
       WX.cellLife = (32 + 24 * Math.random()) * (1 + 3.4 * steady);
-      // Put it upwind, so it comes to you rather than away from you.
-      const gw = windUnit(), r = 15000 + Math.random() * 17000;
-      const j = (Math.random() - 0.5) * 1.3, cj = Math.cos(j), sj = Math.sin(j);
-      stormXZ = [cam.pos[0] + (-gw[0] * cj + gw[1] * sj) * r,
-                 cam.pos[2] + (-gw[1] * cj - gw[0] * sj) * r];
+      // Put it upwind, so it comes to you rather than away from you — but lean
+      // that choice toward wherever you happen to be looking, within reason, so
+      // the day's storm is not routinely behind your head.
+      const gw = windUnit(), r = 15000 + Math.random() * 16000;
+      const upB = Math.atan2(-gw[0], -gw[1]);
+      let d = ((cam.yaw - upB + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
+      d = Math.max(-1.15, Math.min(1.15, d));
+      const brg = upB + d + (Math.random() - 0.5) * 0.55;
+      stormXZ = [cam.pos[0] + Math.sin(brg) * r, cam.pos[2] + Math.cos(brg) * r];
     }
   } else {
     WX.cellAge += dh * 60;
@@ -2476,7 +2612,7 @@ const SCENARIOS = [
   { id:"dusk", hue:"var(--a)", name:"Valley Dusk", tag:"Tier A · fog forming", g:G.fog,
     desc:"Nothing is switched on here. The ground is radiating, the dew-point depression is 3 K and the wind has dropped below 2 m/s — so fog forms, and ponds level in the valleys while the ridges stay clear. Raise the wind and watch it mix away.",
     set:{ dewDep:3, cape:120, coverage:0.16, stratus:0.15, cirrus:0.35, windSpd:1.4, windDir:140, shear:1,
-          sunElev:4.0, sunAz:285, haze:0.30, exposure:1.5, terrain:1050, ground:0.08, snow:3000, sea:-400,
+          sunElev:4.0, sunAz:285, haze:0.30, exposure:1.18, terrain:1050, ground:0.08, snow:3000, sea:-400,
           live:0,altoc:0,bow:0,virga:0,fog:0,halo:0,glory:0,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0 },
     storm:[6000,9000], cam:[-10600,700,-1200], look:[2000,170,600] },
 
@@ -2785,7 +2921,9 @@ const KEYMAP = { KeyW:"w", KeyS:"s", KeyA:"a", KeyD:"d", KeyQ:"q", KeyE:"e",
                  ArrowUp:"w", ArrowDown:"s", ArrowLeft:"a", ArrowRight:"d", Space:"q", KeyC:"e" };
 addEventListener("keydown", e => {
   if (e.target && /INPUT|TEXTAREA/.test(e.target.tagName)) return;
-  if (e.code === "Escape"){ toMenu(); return; }
+  if (e.code === "Escape"){ if (photo){ setPhoto(false); return; } toMenu(); return; }
+  if (e.code === "KeyP" && !inMenu){ setPhoto(!photo); return; }
+  if (photo && e.code === "Enter"){ pendingShot = true; return; }
   if (e.code === "Tab"){ e.preventDefault(); togglePanel(); return; }
   if (e.code === "KeyF"){ S.chase = S.chase > 0.5 ? 0 : 1; syncUI(); return; }
   if (e.code === "KeyL"){ setLive(S.live < 0.5); syncUI(); return; }
@@ -2805,6 +2943,30 @@ addEventListener("blur", () => { for (const k in keys) keys[k] = false; });
 
 function togglePanel(){ panel.classList.toggle("closed"); }
 document.getElementById("panelBtn").addEventListener("click", togglePanel);
+document.getElementById("phShot").addEventListener("click", () => { pendingShot = true; });
+document.getElementById("phExit").addEventListener("click", () => setPhoto(false));
+document.getElementById("phClose").addEventListener("click",
+  () => document.getElementById("phView").classList.add("hidden"));
+document.getElementById("phDl").addEventListener("click", () => {
+  if (!openShotCur) return;
+  const a = document.createElement("a");
+  a.href = openShotCur.url;
+  a.download = "aeolus-" + Date.now() + ".png";
+  document.body.appendChild(a); a.click(); a.remove();
+  phState("saved, if the browser allowed it", 3000);
+});
+document.getElementById("phCopy").addEventListener("click", () => {
+  const sh = openShotCur;
+  if (!sh) return;
+  try {
+    sh.canvas.toBlob(async b => {
+      try {
+        await navigator.clipboard.write([new ClipboardItem({ "image/png": b })]);
+        phState("copied to clipboard", 2600);
+      } catch (e){ phState("clipboard refused — use download", 3600); }
+    }, "image/png");
+  } catch (e){ phState("clipboard unavailable here", 3600); }
+});
 document.getElementById("menuBtn").addEventListener("click", toMenu);
 document.getElementById("resetCam").addEventListener("click", () => {
   cam.pos = currentScn.cam.slice(); lookAt(currentScn.look); cam.speed = 260; accum = 0;
@@ -2827,6 +2989,96 @@ document.querySelectorAll("#pads button").forEach(b => {
   b.addEventListener("pointerdown", e => { e.preventDefault(); set(true); });
   ["pointerup","pointerleave","pointercancel"].forEach(t => b.addEventListener(t, () => set(false)));
 });
+
+
+/* ══════════════════════════ photo mode ══════════════════════════ */
+/* The march is stochastic: every frame it jitters its sample positions and
+   folds the result into a history buffer, so a still camera keeps converging
+   toward the answer instead of sitting on one noisy estimate of it. Photo mode
+   is just that taken seriously — hold the world still, render at full internal
+   resolution with the step count all the way up, and let it settle. The longer
+   you hold the shot, the cleaner it gets, which is exactly how a long exposure
+   behaves and for very nearly the same reason. */
+let photo = false, photoPrev = null, pendingShot = false, shots = [];
+function setPhoto(on){
+  if (on === photo) return;
+  photo = on;
+  const el = document.getElementById("photo");
+  if (on){
+    photoPrev = { quality: S.quality, frozen: frozen, scope: S.scope };
+    // One notch up on step count, not straight to Ultra: a machine that was
+    // already struggling would never finish a frame. Full internal resolution
+    // is handled separately, because that costs shading, not marching.
+    S.quality = Math.min(3, S.quality + 1); dynScale = 1; frozen = true; S.scope = 0;
+    document.getElementById("scope").classList.add("off");
+    document.getElementById("ui").style.opacity = "0";
+    document.getElementById("ui").style.pointerEvents = "none";
+    el.classList.remove("hidden");
+  } else {
+    if (photoPrev){
+      S.quality = photoPrev.quality; frozen = photoPrev.frozen; S.scope = photoPrev.scope;
+      document.getElementById("scope").classList.toggle("off", S.scope < 0.5);
+    }
+    document.getElementById("ui").style.opacity = uiHidden ? "0" : "1";
+    document.getElementById("ui").style.pointerEvents = uiHidden ? "none" : "auto";
+    el.classList.add("hidden");
+    document.getElementById("phView").classList.add("hidden");
+  }
+  document.querySelectorAll("#qseg button").forEach((x, j) =>
+    x.setAttribute("aria-pressed", j === S.quality ? "true" : "false"));
+  const fb = document.getElementById("freezeBtn");
+  if (fb) fb.setAttribute("aria-pressed", frozen ? "true" : "false");
+  accum = 0; syncUI();
+}
+function photoCaption(){
+  const bits = [];
+  if (S.live > 0.5) bits.push(fmtClock(WX.t), WX.phase);
+  bits.push("base " + fmtM(derived.base),
+            "tops " + fmtM(A.super > 0.5 ? derived.EL : derived.top),
+            "alt " + fmtM(cam.pos[1]));
+  return bits.join("  ·  ");
+}
+/* WebGL clears its drawing buffer once the frame is presented, and toBlob is
+   asynchronous — by the time it reads, there is nothing left to read. So take
+   the pixels synchronously, inside the frame that drew them, and let the PNG
+   encoding happen afterwards off a 2-D canvas. */
+function takeShot(){
+  const w = cv.width, h = cv.height, row = w * 4;
+  const px = new Uint8Array(w * h * 4);
+  gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  const c2 = document.createElement("canvas");
+  c2.width = w; c2.height = h;
+  const ctx = c2.getContext("2d");
+  const img = ctx.createImageData(w, h);
+  for (let y = 0; y < h; y++)                        // GL reads bottom-up
+    img.data.set(px.subarray((h - 1 - y) * row, (h - y) * row), y * row);
+  for (let i = 3; i < img.data.length; i += 4) img.data[i] = 255;
+  ctx.putImageData(img, 0, 0);
+  shots.unshift({ url: c2.toDataURL("image/png"), canvas: c2, cap: photoCaption() });
+  while (shots.length > 6) shots.pop();
+  const roll = document.getElementById("phRoll");
+  roll.innerHTML = "";
+  shots.forEach(sh => {
+    const im = document.createElement("img");
+    im.src = sh.url; im.alt = sh.cap; im.title = sh.cap;
+    im.addEventListener("click", () => openShot(sh));
+    roll.appendChild(im);
+  });
+  phState("captured · " + w + " × " + h, 2600);
+}
+let openShotCur = null;
+function openShot(sh){
+  openShotCur = sh;
+  document.getElementById("phImg").src = sh.url;
+  document.getElementById("phView").classList.remove("hidden");
+}
+let phStateT = 0;
+function phState(msg, ms){
+  const e = document.getElementById("phState");
+  e.textContent = msg;
+  clearTimeout(phStateT);
+  if (ms) phStateT = setTimeout(() => { e.textContent = ""; }, ms);
+}
 
 /* ══════════════════════════ frame loop ══════════════════════════ */
 let dynScale = 1, tSim = 0, frameNo = 0, last = performance.now();
@@ -2945,13 +3197,16 @@ function frame(now){
   const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
   const cw = Math.round(innerWidth * dpr), ch = Math.round(innerHeight * dpr);
   if (cv.width !== cw || cv.height !== ch){ cv.width = cw; cv.height = ch; accum = 0; }
-  const sc = QUALITY[S.quality].scale * dynScale;
+  const sc = photo ? Math.max(0.85, QUALITY[S.quality].scale)
+                   : QUALITY[S.quality].scale * dynScale;
   resizeTargets(Math.max(160, Math.round(cw * sc)), Math.max(90, Math.round(ch * sc)));
 
   const rainAmt = inMenu ? 0 : rainAtCamera();
   audioFrame(dt, rainAmt, camMoved ? Math.min(1, cam.speed / 900) : 0);
-  const busy = camMoved || easing || ev.flash > 0.02 || (A.ball > 0.02)
-             || (S.drift > 0.5 && A.super > 0.02) || bolts.length > 0 || A.super > 0.02;
+  // Frozen means frozen: with time stopped there is nothing left moving for
+  // the accumulation buffer to chase, which is what lets a held shot converge.
+  const busy = camMoved || easing || (!frozen && (ev.flash > 0.02 || A.ball > 0.02
+             || bolts.length > 0 || A.super > 0.02));
   if (busy) accum = 0; else accum++;
   const fast = Math.max(A.torn, A.micro, A.haboob, A.ash, A.super * 0.5);
   // A fast clock is a time-lapse: the less real time each frame stands for,
@@ -2974,11 +3229,20 @@ function frame(now){
   setUniforms(b);
   drawQuad();
 
+  bloomPass(rts[cur]);
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   gl.viewport(0, 0, cv.width, cv.height);
   gl.useProgram(progPresent);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, rts[cur]);
   gl.uniform1i(progPresent.u.uTex, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, blT[1]);
+  gl.uniform1i(progPresent.u.uBloom, 1);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.uniform1f(progPresent.u.uBloomAmt, 0.52);
+  gl.uniform1f(progPresent.u.uCA, photo ? 0.0022 : 0.0016);
+  gl.uniform1f(progPresent.u.uGrain, photo ? 0.020 : 0.013);
+  gl.uniform1f(progPresent.u.uGrade, 0.20);
+  gl.uniform1f(progPresent.u.uSat, 0.10);
   gl.uniform2f(progPresent.u.uRes, cv.width, cv.height);
   gl.uniform1f(progPresent.u.uSharp, sc < 0.95 ? QUALITY[S.quality].sharp : 0.0);
   gl.uniform1f(progPresent.u.uTime, tSim);
@@ -3049,8 +3313,15 @@ function frame(now){
     if (q) q.textContent = rtW + " × " + rtH;
     drawRadar();
   }
+  if (photo){
+    document.getElementById("phInfo").textContent = photoCaption();
+    if (!pendingShot && !phStateBusy())
+      phState(accum > 26 ? "settled" : "refining " + Math.min(99, Math.round(accum / 26 * 100)) + "%", 0);
+  }
+  if (pendingShot){ pendingShot = false; takeShot(); }
   requestAnimationFrame(frame);
 }
+function phStateBusy(){ return /captured|clipboard|saved/.test(document.getElementById("phState").textContent); }
 function fmtM(v){ return v >= 1000 ? (v / 1000).toFixed(2) + " km" : Math.round(v) + " m"; }
 
 /* ══════════════════════════ go ══════════════════════════ */
