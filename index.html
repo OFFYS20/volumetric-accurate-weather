@@ -462,6 +462,17 @@ float gLoH, gHiH;
 float gVertLod;   // vertical spacing between samples, for pre-filtering flat layers
 
 /* ─────────────────────────── basics ─────────────────────────── */
+/* Texel size of each noise lookup, in metres of world space, so a march step
+   can ask the mip chain for a value pre-filtered to its own width instead of
+   picking one texel out of it. */
+const float SHAPE_TEXEL = 54.8;    // 96 texels across a 5263 m period
+const float CAULI_TEXEL = 11.0;    // 96 texels across a 1053 m period
+const float DET_TEXEL   =  9.9;    // 48 texels across a  476 m period
+// Biased a third of a level sharp. The temporal buffer is averaging several
+// jittered samples per pixel anyway, so it can absorb a little aliasing, and
+// filtering exactly to the step width throws away detail the frame could hold.
+float mipFor(float lod, float texel){ return max(log2(max(lod / texel, 1.0)) - 0.34, 0.0); }
+
 float hash11(float p){ return fract(sin(p * 78.233) * 43758.5453); }
 float hash12(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
 float hash13(vec3 p){ return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453); }
@@ -1020,12 +1031,20 @@ vec4 sampleMedium(vec3 p, bool cheap, float lod, out float precipF){
     wp.xz = uStorm + rot2(dm, uTime * om);
   }
   vec3 sp = (wp - vec3(uWind.x, 0.0, uWind.y) * uTime) * 0.00019;
-  vec4 sn = texture(uShape, sp);
+  float shapeMip = mipFor(lod, SHAPE_TEXEL);
+  vec4 sn = textureLod(uShape, sp, shapeMip);
   float fogFrac = clamp(fogD / max(form, 1e-4), 0.0, 1.0);
   float d = remap(sn.r, 1.0 - form, 1.0, 0.0, 1.0);
   // Neither a rain curtain nor a fog bank is a carved cumulus edge. Running
   // them through the shape volume stipples one and shreds the other.
   d = mix(d, form, clamp(precipF * 0.78 + fogFrac * 0.42, 0.0, 1.0));
+  // Once the step is wide enough that the mip has averaged the shape noise
+  // toward its mean, carving with it stops describing anything and starts
+  // eating coverage — a filtered noise field tends to 0.5, and remapping 0.5
+  // against a threshold dissolves the cloud. Past that point the analytic form
+  // IS the answer: it is smooth, it cannot alias, and it is what the noise was
+  // modulating in the first place.
+  d = mix(d, form, smoothstep(1.8, 4.2, shapeMip) * 0.80);
   if (d <= 0.0) return vec4(0.0);
 
   // Three erosion tiers at three physically different scales. The coarse
@@ -1037,7 +1056,9 @@ vec4 sampleMedium(vec3 p, bool cheap, float lod, out float precipF){
   // 476 m pass is gated off by LOD at any distance you would actually view a
   // storm from — its step size exceeds that by a few kilometres out.
   float cauliW = 1.0 - smoothstep(2600.0, 11000.0, lod);
-  float fineW  = 1.0 - smoothstep(70.0, 300.0, lod);
+  // With the mip chain doing the filtering, the fine tier can survive further
+  // out than it could when reading it at range meant reading noise.
+  float fineW  = 1.0 - smoothstep(120.0, 640.0, lod);
   float keep = 1.0 - form * 0.22;          // dense cores keep their mass
   // Lens clouds and the glaciated anvil both form in laminar flow. Eroding them
   // with turbulence noise is exactly wrong — it is why they look smooth and cut
@@ -1056,7 +1077,7 @@ vec4 sampleMedium(vec3 p, bool cheap, float lod, out float precipF){
       vec3 cp = wp * 0.00095;
       cp.xz += vec2(sin(wp.z * 0.0007 + uTime * 0.05), cos(wp.x * 0.0006 - uTime * 0.04)) * 0.6;
       cp -= vec3(uWind.x, 0.0, uWind.y) * (uTime * 0.0011);
-      vec4 cn = texture(uShape, cp);
+      vec4 cn = textureLod(uShape, cp, mipFor(lod, CAULI_TEXEL));
       float cauli = cn.g * 0.55 + cn.b * 0.45;
       cauli = mix(cauli, 1.0 - cauli, clamp(hf * 2.0, 0.0, 1.0));
       d = remap(d, cauli * 0.46 * keep * cauliW, 1.0, 0.0, 1.0);
@@ -1070,7 +1091,7 @@ vec4 sampleMedium(vec3 p, bool cheap, float lod, out float precipF){
       dp.xz += vec2(sin(wp.y * 0.0013 + uTime * 0.12),
                     cos(wp.x * 0.0009 - uTime * 0.10)) * 0.55;
       dp -= vec3(uWind.x, 0.0, uWind.y) * (uTime * 0.0027);
-      vec3 dn = texture(uDetail, dp).rgb;
+      vec3 dn = textureLod(uDetail, dp, mipFor(lod, DET_TEXEL)).rgb;
       float det = dn.r * 0.625 + dn.g * 0.25 + dn.b * 0.125;
       det = mix(det, 1.0 - det, clamp(hf * 2.2, 0.0, 1.0));
       d = remap(d, det * 0.30 * keep * fineW, 1.0, 0.0, 1.0);
@@ -1365,7 +1386,7 @@ vec4 marchClouds(vec3 ro, vec3 rd, float tMax, float jitter, out float meanT){
   if (t1 <= t0) return vec4(0.0, 0.0, 0.0, 1.0);
 
   float span   = max(gHiH - gLoH, 400.0);
-  float dtBase = clamp(span / float(uSteps) * 1.6, 20.0, 150.0);
+  float dtBase = clamp(span / float(uSteps) * 1.35, 16.0, 130.0);
   float t  = t0 + jitter * dtBase;
   vec3  scat = vec3(0.0);
   float tr = 1.0, cosT = dot(rd, uSun);
@@ -1376,7 +1397,7 @@ vec4 marchClouds(vec3 ro, vec3 rd, float tMax, float jitter, out float meanT){
 
   for (int i = 0; i < 320; i++){
     if (i >= uSteps || t > t1 || tr < 0.02) break;
-    float dt = max(dtBase, t * 0.035);
+    float dt = max(dtBase, t * 0.014);
     // Near the top of a fog bank, step finely — the layer is thinner than one
     // ordinary step. The floor grows with range, and the refinement stops
     // altogether past 26 km, so a ray running along the top of the fog cannot
@@ -2192,8 +2213,14 @@ const drawQuad = () => gl.drawArrays(gl.TRIANGLES, 0, 3);
 function newVolume(size) {
   const tex = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_3D, tex);
-  gl.texStorage3D(gl.TEXTURE_3D, 1, gl.RGBA8, size, size, size);
-  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  // With a mip chain, a march step of a kilometre can read a value that has
+  // been pre-filtered over a kilometre instead of one texel picked out of it
+  // essentially at random. Point-sampling a 55 m noise field at that spacing is
+  // where the stipple crawling over every distant cloud came from.
+  const levels = Math.max(1, Math.floor(Math.log2(size)) + 1);
+  gl.texStorage3D(gl.TEXTURE_3D, levels, gl.RGBA8, size, size, size);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER,
+                   levels > 1 ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.REPEAT);
   gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.REPEAT);
@@ -2227,7 +2254,12 @@ function bakeVolume(tex, size, mode, label, from, to, done) {
     if (ms > 90) perChunk = Math.max(1, perChunk >> 1);
     else if (ms < 20) perChunk = Math.min(16, perChunk * 2);
     if (z < size) requestAnimationFrame(chunk);
-    else { gl.deleteFramebuffer(fbo); done(); }
+    else {
+      gl.deleteFramebuffer(fbo);
+      gl.bindTexture(gl.TEXTURE_3D, tex);
+      gl.generateMipmap(gl.TEXTURE_3D);
+      done();
+    }
   })();
 }
 
