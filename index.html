@@ -463,6 +463,7 @@ vec2  gWindDir;
 float gWindSpd;
 float gLoH, gHiH;
 float gVertLod;   // vertical spacing between samples, for pre-filtering flat layers
+bool  gCoarse;    // this query is for a shadow, not for the image
 
 /* ─────────────────────────── basics ─────────────────────────── */
 /* Texel size of each noise lookup, in metres of world space, so a march step
@@ -682,6 +683,16 @@ float layerForm(vec3 p, float h, float hf){
     cov *= mix(1.0, hole, uCavum);
   }
   if (cov <= 0.002) return 0.0;
+
+  // A shadow does not need to know which cloud cast it. This is what the
+  // population averages to, in one expression instead of nine cells — and it
+  // matters because the aerial-perspective march asks for a shadow sixteen
+  // times per pixel, so the full field was being evaluated sixteen times over
+  // to decide how dark a patch of haze is.
+  if (gCoarse){
+    float prof = smoothstep(-0.05, 0.13, hf) * smoothstep(1.32, 0.55, hf);
+    return clamp(cov * prof * 0.88, 0.0, 1.0);
+  }
 
   /* ── a population of clouds, not one field carved into cloud shapes ──────
      The deck used to be a single coverage field with a single height profile,
@@ -1474,7 +1485,13 @@ float cloudShadow(vec3 p){
   vec3 q = p + uSun * t;
   float hf = 0.5;
   float sIce, sTop;
+  // One tap, at one height, for how much cloud is between a patch of ground and
+  // the sun. A cloud shadow on the ground is kilometres across and soft-edged;
+  // which cell of the population threw it is not a question the answer depends
+  // on, so the averaged field is the right thing to ask.
+  gCoarse = true;
   float form = layerForm(q, mid, hf) + stormForm(q, mid, sIce, sTop) * 1.6;
+  gCoarse = false;
   return clamp(1.0 - form * 1.45, 0.06, 1.0);
 }
 
@@ -1722,6 +1739,23 @@ const vec3 kCone[6] = vec3[6](
 
 float lightMarch(vec3 p, float lod){
   float d = 0.0, t = 0.0, dt = 70.0;
+  // Six of these are taken per lit sample, which makes the shadow ray about
+  // half of everything the renderer does. What they can afford to skip depends
+  // entirely on what they are travelling THROUGH.
+  //
+  // Through a cumulus field they cross a population: which particular cloud
+  // each sample lands in does not survive the sum, only how much cloud is
+  // there on average, so gCoarse replaces nine lattice cells with the one
+  // expression they average to. Interleaved against the full march that is
+  // two to three per cent of the frame for a third of a per cent of image.
+  //
+  // Through a storm they cross the storm's OWN body, over two kilometres of a
+  // thing that is thirteen deep — and there the variation is the subject. The
+  // striations down an anvil and the shading between the mammatus pouches are
+  // self-shadowing and nothing else; approximate stormForm here and the anvil
+  // comes back as a smooth mushroom cap. So stormForm is always evaluated in
+  // full, and only the layered field is averaged.
+  gCoarse = true;
   for (int i = 0; i < 6; i++){
     vec3 q = p + uSun * (t + dt * 0.5) + kCone[i] * dt * 0.9;
     float pf;
@@ -1729,6 +1763,7 @@ float lightMarch(vec3 p, float lod){
     d += sampleMedium(q, true, max(dt, lod), pf).x * dt;
     t += dt; dt *= 1.65;
   }
+  gCoarse = false;
   return d;
 }
 
@@ -1771,6 +1806,18 @@ vec4 marchClouds(vec3 ro, vec3 rd, float tMax, float jitter, out float meanT){
   for (int i = 0; i < 320; i++){
     if (i >= uSteps || t > t1 || tr < 0.02) break;
     float dt = max(dtBase, t * 0.014);
+    // Let the step grow with how much light this ray has already lost. What
+    // lies beyond a point where two-thirds of the beam is gone arrives at a
+    // third of the weight the front face did, so a third of the difference
+    // between a fine step and a coarse one is all that can reach the image —
+    // and it is the same third whether what lies beyond is the interior of
+    // this cloud or the near face of the next one, because the attenuation in
+    // front of both is the same. Above tr = 0.40 the step is left exactly as
+    // it was, which is the whole of the first optical depth: every edge, every
+    // turret and every striation the eye actually reads is sampled at full
+    // rate. Each sample this skips is six shadow taps not taken, and the
+    // shadow rays are half the cost of the frame.
+    dt *= 1.0 + 1.0 * (1.0 - smoothstep(0.06, 0.40, tr));
     // Budget guard. A ray crossing an anvil at a shallow angle can have tens of
     // kilometres of medium in front of it, and when the step counter runs out
     // before the medium does, the march simply stops: the cloud ends along a
@@ -2460,6 +2507,7 @@ void main(){
   gAero    = 0.16 + 2.1 * uHaze;
   gAmbient = skyAmbient();
   gJitter  = hash12(gl_FragCoord.xy + uFrame * 11.37 + 5.1);
+  gCoarse  = false;
   gLoH = 0.0;
   if (uVirga <= 0.0 && uTorn <= 0.0 && uHaboob <= 0.0 && uMicro <= 0.0 && uAsh <= 0.0 &&
       uLent <= 0.0 && uFogD <= 0.0 && uPrecip <= 0.0 && uSuper <= 0.0)
@@ -4101,6 +4149,31 @@ const radLow = document.createElement("canvas");
 radLow.width = radLow.height = 64;
 const rlctx = radLow.getContext("2d");
 const RAD_M = 40000;
+/* The scope costs more than anything else on the main thread. Each of its four
+   thousand cells is three fBm lookups deep, so redrawing the lot four times a
+   second is a quarter of a million noise evaluations per second — and it lands
+   as a hitch every 250 ms rather than as a slower frame.
+   
+   A radar does not take its picture all at once either. The antenna sweeps, and
+   the picture on the scope is assembled wedge by wedge over the seconds it
+   takes to come round. So do that: one wedge per HUD tick, five seconds for a
+   revolution, and the stored cells stay as they were until the beam reaches
+   them again. Rain advects about seventy metres in that time against cells more
+   than a kilometre across, so nothing about it is visible — only the cost is.
+   
+   What the sweep cannot survive is the camera moving, because the buffer is
+   centred on the camera and every cell in it would then be drawn somewhere it
+   was not measured. One cell of travel is the tolerance; past that the whole
+   scope is rebuilt in one tick, which is what it used to do every tick. */
+const RAD_N = 64, RAD_WEDGES = 20;
+let radImg = null, radAnchor = [1e9, 1e9], radWedge = 0;
+/* Which wedge each cell falls in. Fixed by geometry, so it is worked out once
+   instead of costing an atan per cell per tick. */
+const RAD_WMAP = new Uint8Array(RAD_N * RAD_N);
+for (let j = 0; j < RAD_N; j++)
+  for (let i = 0; i < RAD_N; i++)
+    RAD_WMAP[j * RAD_N + i] = Math.min(RAD_WEDGES - 1, Math.floor(
+      ((Math.atan2(i - RAD_N / 2 + 0.5, -(j - RAD_N / 2 + 0.5)) + Math.PI) / 6.2832) * RAD_WEDGES));
 
 const DBZ_RAMP = [[10, [10, 90, 140, 150]], [20, [24, 150, 70, 200]], [28, [48, 200, 64, 225]],
                   [35, [235, 220, 70, 240]], [42, [240, 155, 45, 248]], [48, [226, 62, 50, 252]],
@@ -4123,23 +4196,29 @@ function drawRadar() {
   rctx.fillStyle = "rgba(6,10,16,0.82)";
   rctx.beginPath(); rctx.arc(cx, cy, R, 0, 6.2832); rctx.fill();
 
-  const N = 64, img = rlctx.createImageData(N, N), step = (RAD_M * 2) / N;
+  const N = RAD_N, step = (RAD_M * 2) / N;
+  if (!radImg) radImg = rlctx.createImageData(N, N);
   // A CAPPI, not a plan projection of the cloud: the scope shows the rain at
   // the level the camera is flying, so the echo lines up with what is out of
   // the window. Fly down into it and the whole field slides downwind, which is
   // what a leaning curtain does.
   const lean = precipLean(cam.pos[1]);
+  const full = Math.hypot(cam.pos[0] - radAnchor[0], cam.pos[2] - radAnchor[1]) > step;
+  if (full) radAnchor = [cam.pos[0], cam.pos[2]];
+  const img = radImg;
   for (let j = 0; j < N; j++) {
     for (let i = 0; i < N; i++) {
+      const k = j * N + i;
+      if (!full && RAD_WMAP[k] !== radWedge) continue;
       const wx = cam.pos[0] + (i - N / 2 + 0.5) * step;
       const wz = cam.pos[2] - (j - N / 2 + 0.5) * step;
-      const k = (j * N + i) * 4;
       const p = precipAt(wx, wz, lean);
-      if (p <= 0.03) { img.data[k + 3] = 0; continue; }
+      if (p <= 0.03) { img.data[k * 4 + 3] = 0; continue; }
       const c = dbzRGBA(10 + p * 54);
-      img.data[k] = c[0]; img.data[k + 1] = c[1]; img.data[k + 2] = c[2]; img.data[k + 3] = c[3];
+      img.data[k*4] = c[0]; img.data[k*4+1] = c[1]; img.data[k*4+2] = c[2]; img.data[k*4+3] = c[3];
     }
   }
+  radWedge = full ? 0 : (radWedge + 1) % RAD_WEDGES;
   rlctx.putImageData(img, 0, 0);
 
   rctx.save();
@@ -4276,6 +4355,7 @@ const sliderEls = {}, chipEls = {};
         if (k === "scope") document.getElementById("scope").classList.toggle("off", S.scope < 0.5);
         if (k === "live" && S.live > 0.5) wxStart(S.tod);
         accum = 0;
+        radAnchor = [1e9, 1e9];   // the field just changed under the sweep
       });
       chipEls[k] = b; row.appendChild(b);
     });

@@ -153,6 +153,43 @@ Things that will mislead you:
   obvious at four degrees of solar elevation. Valley Dusk, Sea of Fog and Night Sky are
   the ones that catch them.
 
+## Where the frame goes
+
+Measured by ablation — build the frame with one piece removed, measure, put it back —
+at 400x225, photo mode, High preset:
+
+| | fair | supercell |
+| --- | --- | --- |
+| cloud march | 83% | 94% |
+| — of which `lightMarch` | ~50% of the whole frame | ~48% |
+| terrain trace | 16% | 3% |
+| everything else | ~320 ms absolute | ~320 ms |
+
+The shadow ray is half the renderer. Almost nothing else is worth touching until it
+is, and the sky, the resolve, the bloom and the present pass together are a rounding
+error against a storm.
+
+What a shadow tap can afford to skip depends on **what it is travelling through**, and
+the line is not where it looks. Through a cumulus field the ray crosses a *population*:
+which particular cloud a sample lands in cannot survive being summed into one number,
+only how much cloud is there on average — so `gCoarse` replaces the nine-cell lattice
+in `layerForm` with the one expression it averages to, for a third of a percent of mean
+image luminance. Through a storm the ray crosses the storm's own body, and there the
+variation IS the subject: the striations down an anvil and the shading between the
+mammatus pouches are self-shadowing and nothing else. Averaging `stormForm` for shadows
+too is about 6% faster and returns the anvil as a smooth mushroom cap. It has been
+tried; do not try it again.
+
+Two things to know before trusting any number from this:
+
+- **SwiftShader runs `sin()` in software.** Every noise lookup is four `hash12`, and
+  `hash12` is a `sin`. A real GPU does that in hardware at quarter rate, so this
+  profile over-weights noise against texture fetches and bandwidth. The ordering is
+  robust; the percentages are not.
+- **The harness drifts by about ±8%.** Two runs of builds doing identical work in the
+  fair scene came out 1753 ms and 1885 ms. Anything smaller than that needs an
+  interleaved comparison — measure A, B, A, B and take medians — not two runs in a row.
+
 ## Git
 
 Branch `claude/volumetric-weather-sandbox-nzqics`. Commit messages here run long on
