@@ -2464,6 +2464,10 @@ void main(){
   if (uLent   > 0.0) gHiH = max(gHiH, uBase + 6500.0);
   if (uCavum  > 0.0) gLoH = 0.0;        // the fall streak hangs below the deck
   if (uCirrus > 0.0) gHiH = max(gHiH, 11000.0);
+  // A density current stands up to 3.2 km whatever the cloud deck above it is
+  // doing. Its own scenario has a base high enough to cover that by accident;
+  // switch the chip on under a low one and the band stopped halfway up it.
+  if (uHaboob > 0.0) gHiH = max(gHiH, 3400.0);
   if (uAsh   > 0.0) gHiH = max(gHiH, 16500.0);
 
   vec2 jit = vec2(hash12(gl_FragCoord.xy + uFrame * 7.13),
