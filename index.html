@@ -436,8 +436,7 @@ layout(location = 1) out vec2 outAux;
 uniform vec2  uRes;
 uniform vec3  uCam;
 uniform mat3  uBasis;
-uniform float uTanHalf, uTime, uFrame, uBlend;
-uniform sampler2D uHist;
+uniform float uTanHalf, uTime, uFrame;
 uniform sampler2D uTrans;      // atmospheric transmittance table
 uniform sampler3D uShape, uDetail;
 uniform int   uSteps;
@@ -1666,7 +1665,10 @@ vec3 starField(vec3 rd, float night){
   // The galactic band: a great circle of unresolved stars, dust-mottled.
   vec3 gpole = normalize(vec3(0.42, 0.63, -0.65));
   float band = exp(-abs(dot(rd, gpole)) * 7.0);
-  float mott = fbm2c(vec2(atan(rd.z, rd.x) * 2.6, rd.y * 5.2) * 1.7);
+  // Look straight up and rd.xz is (0,0), where atan is undefined. The band's
+  // contribution at the zenith is a thousandth of nothing, but NaN does not
+  // care how small the term it poisons was.
+  float mott = fbm2c(vec2(atan(rd.z + 1e-6, rd.x + 1e-6) * 2.6, rd.y * 5.2) * 1.7);
   col += vec3(0.62, 0.66, 0.86) * band * (0.30 + 0.85 * mott) * 0.030;
   return col * night;
 }
@@ -2423,10 +2425,18 @@ vec3 noctilucent(vec3 ro, vec3 rd){
   return vec3(0.42, 0.70, 1.0) * bill * win * (0.25 + fwd * 0.9) * uNLC * 0.42;
 }
 
-vec3 ballGlow(vec3 ro, vec3 rd){
+/* A luminous body a few hundred metres away, not a sky phenomenon: it has a
+   position, so the ground can be in front of it. tMax is where the terrain
+   trace stopped, and without that test the ball shines straight through the
+   ridge it is meant to be drifting behind. Its brightness does not fall with
+   range because a source's radiance does not — what shrinks is the solid angle
+   it covers, and perp being measured in metres against a fixed radius is
+   already that. */
+vec3 ballGlow(vec3 ro, vec3 rd, float tMax){
   if (uBall.w <= 0.0) return vec3(0.0);
   vec3 d = uBall.xyz - ro;
-  if (dot(d, rd) <= 0.0) return vec3(0.0);
+  float along = dot(d, rd);
+  if (along <= 0.0 || along > tMax) return vec3(0.0);
   float perp = length(cross(rd, d));
   float core = smoothstep(uBall.w, uBall.w * 0.3, perp);
   float halo = exp(-perp / (uBall.w * 5.0));
@@ -2468,6 +2478,7 @@ void main(){
   // doing. Its own scenario has a base high enough to cover that by accident;
   // switch the chip on under a low one and the band stopped halfway up it.
   if (uHaboob > 0.0) gHiH = max(gHiH, 3400.0);
+  if (uTorn   > 0.0) gHiH = max(gHiH, uBase + 700.0);   // funnel flare into the wall
   if (uAsh   > 0.0) gHiH = max(gHiH, 16500.0);
 
   vec2 jit = vec2(hash12(gl_FragCoord.xy + uFrame * 7.13),
@@ -2492,7 +2503,7 @@ void main(){
     col += nacreous(ro, rd);
     col += noctilucent(ro, rd);
   }
-  col += ballGlow(ro, rd);
+  col += ballGlow(ro, rd, tMax);
 
   float meanT;
   vec4 cl = marchClouds(ro, rd, tMax, jit.x, meanT);
@@ -3367,9 +3378,25 @@ function stepEvents(dt, t) {
     ev.ballLife -= dt;
     if (ev.ballLife <= 0) {
       ev.ballLife = 6 + Math.random() * 6;
-      ev.ball = [cam.pos[0] + (Math.random() - 0.5) * 220,
-                 Math.max(12, terrainGuess(cam.pos[0], cam.pos[2]) + 14 + Math.random() * 20),
-                 cam.pos[2] + (Math.random() - 0.5) * 220, 0.22];
+      // Twenty centimetres across is only visible from tens of metres away, so
+      // where it forms decides whether it forms at all. It was dropped in a
+      // random ring around the camera at ground level, which put it behind the
+      // observer half the time and hundreds of metres below them always —
+      // every scenario starts well up in the air, so the chip drew nothing in
+      // any of them.
+      //
+      // It goes ahead of the camera now, scattered across the width of the
+      // view, at the observer's own level: on the ground when you are standing
+      // on it, out at your altitude when you are not. Ball lightning is
+      // reported from the surface and from aircraft alike — what it needs is a
+      // discharge nearby, not the ground under it.
+      const bd = cam.yaw + (Math.random() - 0.5) * 0.9;
+      const br = 45 + Math.random() * 110;
+      const bx = cam.pos[0] + Math.sin(bd) * br, bz = cam.pos[2] + Math.cos(bd) * br;
+      const bg = terrainJS(bx, bz) + 14 + Math.random() * 20;
+      ev.ball = [bx, cam.pos[1] < bg + 120 ? Math.max(12, bg)
+                                           : cam.pos[1] + (Math.random() - 0.5) * 40,
+                 bz, 0.22];
     }
     ev.ball[0] += derived.wind[0] * dt * 0.25 + Math.sin(t * 1.7) * 0.5;
     ev.ball[2] += derived.wind[1] * dt * 0.25 + Math.cos(t * 1.3) * 0.5;
@@ -3586,9 +3613,23 @@ function stormMotionVec() {
    lens agree with what is actually being drawn instead of inventing a second,
    disagreeing field. Both halves are here: the organised supercell core, and
    the cellular rain any deep deck produces. */
-function precipAt(x, z) {
+/* How far downwind the rain reaching level y has drifted since it left the
+   cloud. A drop falls at about 9 m/s, so it slides (wind / 9) metres sideways
+   for every metre it descends — the same figure shaftForm() leans the curtains
+   by. The scope and the rain on the lens read the CPU mirror, so if the mirror
+   ignores the lean it reports the rain where the CLOUD is, up to a kilometre
+   and a half from where the curtain is actually being drawn. */
+function precipLean(y) {
+  const drop = Math.max(derived.base - y, 0);
+  const w = Math.hypot(derived.wind[0], derived.wind[1]);
+  return drop * Math.max(0.12, Math.min(1.3, w / 9));
+}
+function precipAt(x, z, lean) {
   let rate = 0;
   const t = tSim;
+  const gw = windUnit();
+  lean = lean || 0;
+  x -= gw[0] * lean; z -= gw[1] * lean;
   if (derived.precip > 0.01) {
     const qx = x - derived.wind[0] * t, qz = z - derived.wind[1] * t;
     const w = jfbmc(qx * 0.00011, qz * 0.00011) * 0.72
@@ -3598,8 +3639,12 @@ function precipAt(x, z) {
     rate = smoothstepJS(0.58, 0.94, cov) * smoothstepJS(0.36, 0.76, cell) * derived.precip;
   }
   if (A.super > 0.03) {
-    const core = derived.core, gw = windUnit();
-    const dx = x - stormXZ[0], dz = z - stormXZ[1];
+    // The forward-flank core is a body of rain several kilometres deep, so it
+    // does not drift as far as a curtain hanging out of a shallow deck: the
+    // shader leans it by 0.6 of the full figure, and so must this.
+    const core = derived.core;
+    const dx = x - stormXZ[0] + gw[0] * lean * 0.4,
+          dz = z - stormXZ[1] + gw[1] * lean * 0.4;
     const r = Math.hypot(dx, dz);
     const sx = dx - gw[0] * core * 0.62, sz = dz - gw[1] * core * 0.62;
     let along = sx * gw[0] + sz * gw[1];
@@ -3612,7 +3657,7 @@ function precipAt(x, z) {
   return rate;
 }
 function rainAtCamera() {
-  return precipAt(cam.pos[0], cam.pos[2])
+  return precipAt(cam.pos[0], cam.pos[2], precipLean(cam.pos[1]))
        * (1 - smoothstepJS(derived.base, derived.base + 900, cam.pos[1]));
 }
 
@@ -4079,12 +4124,17 @@ function drawRadar() {
   rctx.beginPath(); rctx.arc(cx, cy, R, 0, 6.2832); rctx.fill();
 
   const N = 64, img = rlctx.createImageData(N, N), step = (RAD_M * 2) / N;
+  // A CAPPI, not a plan projection of the cloud: the scope shows the rain at
+  // the level the camera is flying, so the echo lines up with what is out of
+  // the window. Fly down into it and the whole field slides downwind, which is
+  // what a leaning curtain does.
+  const lean = precipLean(cam.pos[1]);
   for (let j = 0; j < N; j++) {
     for (let i = 0; i < N; i++) {
       const wx = cam.pos[0] + (i - N / 2 + 0.5) * step;
       const wz = cam.pos[2] - (j - N / 2 + 0.5) * step;
       const k = (j * N + i) * 4;
-      const p = precipAt(wx, wz);
+      const p = precipAt(wx, wz, lean);
       if (p <= 0.03) { img.data[k + 3] = 0; continue; }
       const c = dbzRGBA(10 + p * 54);
       img.data[k] = c[0]; img.data[k + 1] = c[1]; img.data[k + 2] = c[2]; img.data[k + 3] = c[3];

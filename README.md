@@ -141,7 +141,9 @@ right of the mean wind at three-quarters of its speed, so it can be followed,
 intercepted, or lost. The HUD carries range, bearing and storm motion; the
 scope in the corner is a reflectivity display sampled from the same
 precipitation field the renderer uses, so the hook and the rain-free notch you
-see on radar are the ones you can fly into.
+see on radar are the ones you can fly into. It reads at your own altitude, so
+the echo sits downwind of the storm marker by however far the curtains have
+leaned by the time they reach you.
 
 Lightning is geometry rather than a screen flash: a midpoint-displaced channel
 from the charge region to the ground, forked, lighting the cloud from inside

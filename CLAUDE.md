@@ -67,6 +67,13 @@ the rain on the lens all read the CPU copies; if they drift, the scope shows rai
 is not being drawn. `derived.core` is passed to the shader as `uCore` for the same
 reason — the turret solver and `stormForm` have to agree on how wide the storm is.
 
+Mirroring the formula is not enough — the arguments have to match too. `rainRate()`
+takes a *lean*, because a drop falls at about 9 m/s and slides `(wind / 9)` metres
+downwind for every metre it descends, so the curtain reaching the ground left its
+cloud a kilometre or more upwind. `precipAt()` ignored that argument for a long time
+and so reported the column under the cloud rather than the curtain under the camera.
+Callers now ask for the lean at the level they care about: `precipLean(cam.pos[1])`.
+
 **Scenarios own their exposure.** `applyScenario` resets `S.exposure` to 1.0 when the
 scenario does not name one, so brightness does not depend on the order you clicked
 through the menu.
