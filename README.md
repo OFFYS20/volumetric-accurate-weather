@@ -32,7 +32,9 @@ Thirteen scenarios set up an environment; the phenomena then follow from it.
 
 - **Tier A** — cumuliform and stratiform decks, altocumulus billow rows, rain shafts
   and the scud under them, virga, radiation fog, crepuscular rays, the 42° rainbow with
-  its secondary and Alexander's dark band, lenticular stacks, cirrus veil, and the ice
+  its secondary and Alexander's dark band, lenticular stacks standing in the lee waves
+  their ridges launch, glories whose ring radius reads out the droplet size that made
+  them, cirrus veil, and the ice
   halo complex — the 22° and 46° rings, sun dogs that move outward as the sun rises and
   are gone by 61°, the colourless parhelic circle right round the sky at the sun's own
   altitude, and the circumzenithal arc, which comes from a 90° prism rather than a 60°

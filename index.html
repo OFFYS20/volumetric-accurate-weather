@@ -1187,21 +1187,62 @@ float shaftForm(vec3 p, float h, out float rainf){
   return rainf * 0.88;
 }
 
+/* Lenticular cloud — a standing lee wave made visible.
+
+   Air pushed up over a ridge is displaced above the level where it is neutrally
+   buoyant, so buoyancy pulls it back down past it and it oscillates: while the
+   wind carries it downstream the streamlines corrugate, with a period of
+   2πU/N — five to fifteen kilometres for the winds that make these. Where a
+   crest lifts moist air past its condensation level there is cloud, and where
+   the following trough brings it back down there is not. That is why a
+   lenticular is a lens with clean edges, why they come in trains downwind of a
+   mountain, and why the cloud stands still in a gale: the WAVE is stationary
+   and the air moves through it, condensing at the upwind edge and evaporating
+   again at the downwind one.
+
+   So none of this is placed. It is wherever the crests are, which is downwind
+   of whatever ridge is upwind of it. */
 float lentForm(vec3 p){
   if (uLent <= 0.0) return 0.0;
+  float h = hgt(p);
+  if (h < uBase + 120.0 || h > uBase + 6400.0) return 0.0;
+
+  const float BV = 0.0115;                        // Brunt–Väisälä, stable troposphere
+  float lam = 6.2831 * max(gWindSpd, 5.0) / BV;
+
+  float along = dot(p.xz, gWindDir);
+  float cross = dot(p.xz, vec2(-gWindDir.y, gWindDir.x));
+
+  // The wave has to have been launched by something. How high the ground is a
+  // little over a wavelength upwind sets how hard the air was thrown, and so
+  // whether there is a wave here at all — no ridge, no lenticular.
+  vec2  src   = p.xz - gWindDir * (lam * 1.10);
+  float ridge = terrainH(src);
+  float amp = 780.0 * smoothstep(280.0, 1500.0, ridge);
+  if (amp < 40.0) return 0.0;
+
+  float phase = along * (6.2831 / lam) + ridge * 0.0013;
+
   float d = 0.0;
-  for (int i = 0; i < 3; i++){
-    float fi = float(i);
-    vec3 c = vec3(-11000.0 + fi * 1400.0, uBase + 900.0 + fi * 1500.0, -9000.0 - fi * 900.0);
-    vec3 q = p - c;
-    q.xz = rot2(q.xz, 0.55);
-    vec3 s = q / vec3(5600.0, 300.0 + fi * 55.0, 2400.0);
-    float e = 1.0 - dot(s, s);
-    // wave striations along the lens
-    float st = 0.85 + 0.15 * sin(q.x * 0.0022 + q.z * 0.0009);
-    d = max(d, smoothstep(0.0, 0.32, e) * (0.9 - fi * 0.16) * st);
+  for (int k = 0; k < 3; k++){
+    float fk = float(k);
+    // Each moist layer makes its own lens and they stack, because every one of
+    // them is riding the same wave.
+    float lvl  = uBase + 700.0 + fk * 1450.0;
+    // Nearly in phase with each other on purpose: all three layers ride the
+    // same wave, so their crests sit almost above one another and the lenses
+    // stack into the pile of plates that gives the cloud its other name.
+    float disp = amp * cos(phase + fk * 0.12) * (1.0 - fk * 0.17);
+    float lift = smoothstep(0.20, 0.80, disp / max(amp, 1.0) * 0.5 + 0.5);
+    if (lift <= 0.0) continue;
+    float thick = 255.0 + 90.0 * fk;
+    float band  = exp(-pow((h - lvl - disp * 0.45) / thick, 2.0));
+    // Elongated along the ridge that made them, not endless ribbons across it.
+    float lat = smoothstep(0.36, 0.78,
+                  fbm2c(vec2(cross * 0.000055, along * 0.000018) + fk * 5.1));
+    d = max(d, band * lift * lat * (0.95 - fk * 0.16));
   }
-  return d * uLent;
+  return clamp(d, 0.0, 1.0) * uLent;
 }
 
 float haboobForm(vec3 p, float h, out float roll){
@@ -1367,7 +1408,7 @@ vec4 sampleMedium(vec3 p, bool cheap, float lod, out float precipF){
   // from soap in real life, while the tower beside them boils.
   float iceFrac = ice * clamp(storm / max(form, 1e-4), 0.0, 1.0);
   float laminar = max(clamp(lent / max(form, 1e-4), 0.0, 1.0), iceFrac);
-  keep *= 1.0 - laminar * 0.72;
+  keep *= 1.0 - laminar * 0.93;
   // Neither rain nor fog boils the way a convective cloud does.
   keep *= 1.0 - clamp(precipF * 0.85 + fogFrac * 0.80, 0.0, 1.0);
   if (!cheap){
@@ -2023,7 +2064,8 @@ vec3 spectrum(float x){                     // 0 = violet, 1 = red
 
 /* ─────────────────────────── angular optics ─────────────────────────── */
 vec3 angularOptics(vec3 rd, float cloudTr, float skyMask){
-  vec3 c = vec3(0.0);
+  vec3 c = vec3(0.0);   // seen against clear sky
+  vec3 g = vec3(0.0);   // seen against cloud
   float mu = clamp(dot(rd, uSun), -1.0, 1.0);
   float th = acos(mu);
 
@@ -2094,24 +2136,46 @@ vec3 angularOptics(vec3 rd, float cloudTr, float skyMask){
   }
 
   if (uGlory > 0.0){
+    // Backscatter interference: light that has run round the surface of a
+    // droplet and come back out the way it came in. Whether it returns in phase
+    // depends on the droplet's circumference measured in wavelengths, so the
+    // ring radius goes as λ/a — the rings sit at DIFFERENT ANGLES for different
+    // colours rather than a ring being tinted, which is why red is on the
+    // outside of every one of them. It also means the pattern is a direct
+    // readout of droplet size: fine droplets, wide rings.
     float back = PI - th;
-    if (back < 0.16){
-      float rings = 0.5 + 0.5 * cos(back * 150.0);
-      vec3  tint  = 0.5 + 0.5 * cos(vec3(0.0, 2.1, 4.2) + back * 150.0);
-      c += tint * rings * exp(-back / 0.045) * uGlory * 0.55;
+    if (back < 0.24){
+      const float a = 6.0e-6;                       // droplet radius, metres
+      vec3  lam   = vec3(0.66e-6, 0.55e-6, 0.46e-6);
+      vec3  x     = back * (2.0 * a) / lam;         // maxima at integer x
+      vec3  rings = 0.5 + 0.5 * cos((x - 0.22) * 6.2831);
+      g += rings * rings * exp(-back / 0.055) * uGlory * 0.9;
     }
   }
 
   if (uPillar > 0.0){
-    // Specular reflection off horizontally-oriented plate crystals: a vertical
-    // smear of the light source, not a beam.
-    vec3 sh = normalize(vec3(uSun.x, 0.0, uSun.z));
-    vec3 rh = normalize(vec3(rd.x, 0.0, rd.z) + 1e-6);
-    float az = clamp(dot(sh, rh), 0.0, 1.0);
-    float pil = pow(az, 1400.0) * exp(-abs(rd.y - uSun.y) * 4.5);
-    c += vec3(1.0, 0.86, 0.62) * pil * uPillar * 2.2;
+    // Plate crystals fall face-down but rock as they go, and a plate tilted by
+    // β reflects the sun to an elevation 2β away from it. So the pillar's
+    // length is set by the rocking and by nothing else, it stands above a low
+    // sun and hangs below a high one, and — being a reflection rather than a
+    // refraction — it is exactly the colour of the sun, which is why a pillar
+    // at sunset is the same orange as the sunset.
+    vec3  sh  = normalize(vec3(uSun.x, 0.0, uSun.z));
+    vec3  rh  = normalize(vec3(rd.x, 0.0, rd.z) + 1e-6);
+    float dAz = acos(clamp(dot(sh, rh), -1.0, 1.0));
+    float dEl = rd.y - uSun.y;
+    const float wob = 0.055;                        // rms rocking, radians
+    // Sideways it falls off far faster: tilting a plate across the line of
+    // sight barely moves the glint, tilting it along the line of sight moves it
+    // a long way. That asymmetry is the whole reason a pillar is a column.
+    float pil = exp(-abs(dEl) / (2.2 * wob)) * exp(-pow(dAz / 0.030, 2.0));
+    c += SOLAR * sunTrans(3000.0, uSun.y) * pil * uPillar * 0.026;
   }
-  return c * cloudTr * skyMask;
+  // The glory is the one of these that REQUIRES cloud in front of you —
+  // it is made by the droplets themselves — so weighting it by the same
+  // transmittance as the rest was suppressing it in precisely the place it
+  // exists, and it has never once been visible.
+  return c * cloudTr * skyMask + g * (1.0 - cloudTr);
 }
 
 /* A rainbow needs three things at once: the sun low and behind you, rain in
@@ -2153,28 +2217,77 @@ vec3 rainbow(vec3 ro, vec3 rd, float tEnd){
 }
 
 /* ─────────────────────────── upper atmosphere ─────────────────────────── */
+/* Red sprite.
+
+   Not lightning, and not a small one. A sprite is a glow discharge in air a
+   hundred thousand times thinner than at the ground, set off when a large
+   positive stroke pulls enough charge out of a storm to leave a field standing
+   across the mesosphere. So it appears WITH the stroke and is gone in a few
+   tens of milliseconds, and it is red because at seventy kilometres the excited
+   nitrogen has time to radiate its first positive band before a collision takes
+   the energy off it. At the bottom of the tendrils the air is thicker,
+   collisions come sooner, and what escapes is the blue first-negative band of
+   the ion instead.
+
+   The shape is three things and not one: a broad flat halo at eighty
+   kilometres, from the electrostatic field alone and needing no streamer; a
+   body below it; and tendrils reaching down toward forty-five, splitting as
+   they go, because a streamer branches whenever the field at its tip runs ahead
+   of what the air in front can hold. */
 vec3 sprites(vec3 ro, vec3 rd){
   if (uSprite <= 0.0) return vec3(0.0);
+  // It goes with the stroke. A little standing glow is kept so that the
+  // phenomenon can be found at all between discharges.
+  float trig = 0.55 + 1.5 * clamp(uFlash, 0.0, 1.0);
   float t0, t1;
-  if (!bandRange(ro, rd, 42000.0, 92000.0, 600000.0, t0, t1)) return vec3(0.0);
+  if (!bandRange(ro, rd, 40000.0, 92000.0, 600000.0, t0, t1)) return vec3(0.0);
   vec3 acc = vec3(0.0);
-  float dt = (t1 - t0) / 16.0;
+  const int N = 18;
+  float dt = (t1 - t0) / float(N);
   vec2 centre = uStorm + vec2(9000.0, -6000.0);
-  for (int i = 0; i < 16; i++){
-    vec3 p = ro + rd * (t0 + dt * (float(i) + 0.5));
+  for (int i = 0; i < N; i++){
+    vec3  p = ro + rd * (t0 + dt * (float(i) + gJitter));
     float h = hgt(p);
+    if (h < 40000.0 || h > 92000.0) continue;
     vec2  d = p.xz - centre;
     float r = length(d);
-    float f = clamp((h - 42000.0) / 50000.0, 0.0, 1.0);
-    // Carrot morphology: a diffuse head high up, tendrils reaching down.
-    float rad  = 2200.0 + 17000.0 * f;
-    float body = smoothstep(rad, rad * 0.12, r);
-    float br   = 0.35 + 0.65 * pow(abs(sin(atan(d.y, d.x) * 7.0 + r * 0.00035)), 3.0);
-    float dens = body * br * smoothstep(0.06, 0.34, f) * smoothstep(1.0, 0.62, f);
-    vec3  col  = mix(vec3(0.30, 0.45, 1.0), vec3(1.0, 0.14, 0.20), smoothstep(0.20, 0.55, f));
-    acc += col * dens * dt * 2.6e-5;
+
+    float halo = exp(-pow((h - 79000.0) / 3800.0, 2.0)) * smoothstep(38000.0, 8000.0, r);
+    float body = exp(-pow((h - 71000.0) / 4600.0, 2.0)) * smoothstep(15000.0, 2500.0, r);
+
+    // 0 at the bottom of the tendril region, 1 up at the body.
+    float f = clamp((h - 43000.0) / 31000.0, 0.0, 1.0);
+    // The channel count roughly doubles every few kilometres of descent, so the
+    // field is coarse where the streamers leave the body and fine by the time
+    // they reach forty-five. Raising the lookup frequency on the way down
+    // reproduces that without simulating a single branch.
+    float freq = mix(2.9, 0.75, f) / 5200.0;
+    vec2  q  = d * freq + vec2(sin(h * 0.00019), cos(h * 0.00023)) * 0.45 * (1.0 - f);
+    vec2  gi = floor(q), gf = fract(q);
+    float best = 9.0, bid = 0.0;
+    for (int y = -1; y <= 1; y++){
+      for (int x = -1; x <= 1; x++){
+        vec2  o  = vec2(float(x), float(y));
+        float hh = hash12(gi + o + 3.7);
+        vec2  cc = o + vec2(fract(hh * 17.31), fract(hh * 91.77));
+        vec2  ee = gf - cc;
+        float dd = dot(ee, ee);
+        if (dd < best){ best = dd; bid = hh; }
+      }
+    }
+    // Every channel stops at its own depth, and they splay apart coming down.
+    float bot  = 0.04 + 0.44 * fract(bid * 313.7);
+    float chan = smoothstep(0.30, 0.02, sqrt(best))
+               * smoothstep(bot - 0.05, bot + 0.12, f)
+               * smoothstep(1.00, 0.80, f)
+               * smoothstep(6000.0 + 26000.0 * (1.0 - f), 1500.0, r);
+
+    float dens = halo * 0.45 + body + chan * 0.95;
+    if (dens <= 0.0015) continue;
+    vec3 col = mix(vec3(0.36, 0.44, 1.0), vec3(1.0, 0.13, 0.20), smoothstep(0.04, 0.30, f));
+    acc += col * dens * dt;
   }
-  return acc * uSprite;
+  return acc * uSprite * trig * 3.2e-5;
 }
 
 /* Aurora.
@@ -2345,6 +2458,10 @@ void main(){
   if (uSuper > 0.0) gHiH = max(gHiH, uEL + 7800.0);   // overshoot + its fade
   if (uFogD  > 0.0) gHiH = max(gHiH, uFogLvl + 90.0);
   if (uAltoc  > 0.0) gHiH = max(gHiH, 5350.0);
+  // The lenticular stack sits kilometres above the deck it shares a base
+  // with. Without this the band stopped underneath it and the Lee Wave
+  // scenario marched right past every lens in it.
+  if (uLent   > 0.0) gHiH = max(gHiH, uBase + 6500.0);
   if (uCavum  > 0.0) gLoH = 0.0;        // the fall streak hangs below the deck
   if (uCirrus > 0.0) gHiH = max(gHiH, 11000.0);
   if (uAsh   > 0.0) gHiH = max(gHiH, 16500.0);
@@ -3864,11 +3981,11 @@ const SCENARIOS = [
     storm:[0,0], cam:[-9000,1500,-9000], look:[0,6500,0] },
 
   { id:"fog", hue:"var(--a)", name:"Sea of Fog", tag:"Tier A · radiation fog", g:G.fog,
-    desc:"Cold air draining into the valleys overnight, with the sun just clearing the ridge. Look away from it for the glory.",
+    desc:"Cold air drained into the valleys overnight and the sun is just clearing the ridge behind you. A glory sits on the antisolar point — which is to say around your own shadow — so it can only ever be seen with the sun at your back, looking down at cloud. Its rings come from droplets small enough for light to run right round them, and their radius goes as wavelength over droplet size, so the pattern is a direct readout of how fine the fog is.",
     set:{ dewDep:14, cape:150, coverage:0.22, stratus:0.6, cirrus:0, windSpd:2, windDir:90, shear:1,
-          sunElev:5, sunAz:95, haze:0.45, terrain:1200, ground:0.1, snow:2800, sea:-400,
+          sunElev:5, sunAz:234, haze:0.45, terrain:1200, ground:0.1, snow:2800, sea:-400,
           live:0,altoc:0,bow:1,virga:0,fog:1,halo:0,glory:1,pillar:0,lent:0,cavum:0,super:0,torn:0,micro:0,haboob:0,ash:0,fuji:0,sprite:0,nlc:0,ball:0,aurora:0,nacre:0 },
-    storm:[6000,9000], cam:[-2400,1450,-1200], look:[4000,300,3500] },
+    storm:[6000,9000], cam:[-2400,1700,-1200], look:[3920,1420,3440] },
 
   { id:"ice", hue:"var(--a)", name:"Ice Optics", tag:"Tier A/C · halo, dogs, pillars", g:G.ice,
     desc:"A cirrostratus veil of hexagonal prisms. The 22° ring, its parhelia and a pillar from the oriented plates.",
